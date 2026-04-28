@@ -555,3 +555,43 @@ def register_execution_tools(mcp: FastMCP):
                     "Check the debug session is still connected"
                 ]
             }
+
+    @mcp.tool()
+    async def set_command_echo(ctx: Context, enabled: bool) -> Dict[str, Any]:
+        """
+        Enable or disable command echo in WinDbg's output window.
+
+        When enabled, every command the AI sends to WinDbg and its returned output
+        are printed directly in WinDbg's command window (prefixed with [MCP>>] and
+        [MCP<<]), making it easy to observe AI activity in real time.
+
+        This is equivalent to typing `mcpecho on` or `mcpecho off` inside WinDbg.
+        Output longer than 2048 characters is truncated in the echo to avoid
+        flooding the WinDbg window; the full output is still returned to the AI.
+
+        Args:
+            ctx: The MCP context
+            enabled: True to turn echo on, False to turn it off
+
+        Returns:
+            Status and the new echo state.
+        """
+        logger.debug(f"Setting command echo to: {enabled}")
+        try:
+            result = send_handler_command("set_echo", timeout_ms=3000, enabled=enabled)
+            return {
+                "success": True,
+                "echo_enabled": enabled,
+                "message": result.get("output", ""),
+                "note": "You can also toggle echo in WinDbg directly: mcpecho on|off"
+            }
+        except Exception as e:
+            logger.error(f"set_command_echo failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "suggestions": [
+                    "Ensure the WinDbg extension is loaded (.load windbgmcpExt.dll)",
+                    "Check the pipe connection is active"
+                ]
+            }

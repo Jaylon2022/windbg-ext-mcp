@@ -52,7 +52,18 @@ public:
      * @return JSON response indicating whether the interrupt was sent successfully.
      */
     static json BreakIntoTargetHandler(const json& message);
-    
+
+    /**
+     * @brief Enable or disable command echo to WinDbg output window.
+     *
+     * Args (in message["args"]):
+     *   enabled (bool, optional): true to turn echo on, false to turn it off.
+     *   If omitted, returns the current state without changing it.
+     * @param message JSON message.
+     * @return JSON response with the current echo state.
+     */
+    static json SetEchoHandler(const json& message);
+
     /**
      * @brief Collect performance metrics.
      * @param message JSON message (no parameters required).

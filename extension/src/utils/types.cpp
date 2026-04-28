@@ -89,12 +89,15 @@ HRESULT __stdcall DebugExtensionInitialize(PULONG version, PULONG flags) {
  */
 STDAPI help(IDebugClient* client, PCSTR args) {
 	dprintf("WinDBG MCP Extension Help\n");
-	dprintf("  help - show this help\n");
-	dprintf("  hello - display a test message\n");
-	dprintf("  objecttypes [name] - display object types filtered by 'name'\n");
-	dprintf("  mcpstart - start the MCP server if not already running\n");
-	dprintf("  mcpstop - stop the MCP server if running\n");
-	dprintf("  mcpstatus - show MCP server status\n");
+	dprintf("  help         - show this help\n");
+	dprintf("  hello        - display a test message\n");
+	dprintf("  objecttypes  - display kernel object types\n");
+	dprintf("  mcpstart     - start the MCP server if not already running\n");
+	dprintf("  mcpstop      - stop the MCP server if running\n");
+	dprintf("  mcpstatus    - show MCP server status\n");
+	dprintf("  mcpecho      - toggle AI command echo  (mcpecho on|off|status)\n");
+	dprintf("                 when ON, every command the AI sends and its output\n");
+	dprintf("                 are printed here in WinDbg's command window.\n");
 
 	return S_OK;
 }
@@ -214,7 +217,39 @@ STDAPI mcpstatus(IDebugClient* client, PCSTR args) {
 	} else {
 		dprintf("MCP server is not running\n");
 	}
+	dprintf("Command echo: %s  (toggle with: mcpecho on|off)\n",
+	        CommandUtilities::GetEchoEnabled() ? "ON" : "OFF");
 
+	return S_OK;
+}
+
+/**
+ * @brief Toggle or query AI command echo to the WinDbg output window.
+ *
+ * Usage: mcpecho on|off|<empty>
+ */
+STDAPI mcpecho(IDebugClient* client, PCSTR args) {
+	std::string arg = args ? args : "";
+	// Trim leading/trailing spaces
+	auto trim = [](std::string s) {
+		s.erase(0, s.find_first_not_of(" \t"));
+		s.erase(s.find_last_not_of(" \t") + 1);
+		return s;
+	};
+	arg = trim(arg);
+
+	if (arg == "on" || arg == "1") {
+		CommandUtilities::SetEchoEnabled(true);
+		dprintf("MCP command echo: ON\n"
+		        "  Commands sent by the AI and their output will now be printed here.\n");
+	} else if (arg == "off" || arg == "0") {
+		CommandUtilities::SetEchoEnabled(false);
+		dprintf("MCP command echo: OFF\n");
+	} else {
+		dprintf("MCP command echo is currently: %s\n",
+		        CommandUtilities::GetEchoEnabled() ? "ON" : "OFF");
+		dprintf("Usage: mcpecho on|off\n");
+	}
 	return S_OK;
 }
 

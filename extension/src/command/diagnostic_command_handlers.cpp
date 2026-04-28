@@ -8,6 +8,7 @@ void DiagnosticCommandHandlers::RegisterHandlers(MCPServer& server) {
     server.RegisterHandler("health_check", HealthCheckHandler);
     server.RegisterHandler("performance_metrics", PerformanceMetricsHandler);
     server.RegisterHandler("break_into_target", BreakIntoTargetHandler);
+    server.RegisterHandler("set_echo", SetEchoHandler);
 }
 
 json DiagnosticCommandHandlers::HealthCheckHandler(const json& message) {
@@ -108,6 +109,38 @@ json DiagnosticCommandHandlers::BreakIntoTargetHandler(const json& message) {
         return CommandUtilities::CreateErrorResponse(
             id, "break_into_target",
             std::string("Exception during break_into_target: ") + e.what()
+        );
+    }
+}
+
+json DiagnosticCommandHandlers::SetEchoHandler(const json& message) {
+    int id = message.value("id", 0);
+    try {
+        auto args = message.value("args", json::object());
+        if (args.contains("enabled")) {
+            bool enabled = args.value("enabled", false);
+            CommandUtilities::SetEchoEnabled(enabled);
+            return CommandUtilities::CreateSuccessResponse(
+                id, "set_echo",
+                enabled ? "Command echo enabled: commands and output will be printed in WinDbg."
+                        : "Command echo disabled."
+            );
+        }
+        // Query current state without changing it
+        bool current = CommandUtilities::GetEchoEnabled();
+        return {
+            {"type", "response"},
+            {"id", id},
+            {"status", "success"},
+            {"command", "set_echo"},
+            {"echo_enabled", current},
+            {"output", std::string("Command echo is currently ") + (current ? "ON" : "OFF")}
+        };
+    }
+    catch (const std::exception& e) {
+        return CommandUtilities::CreateErrorResponse(
+            id, "set_echo",
+            std::string("set_echo failed: ") + e.what()
         );
     }
 }

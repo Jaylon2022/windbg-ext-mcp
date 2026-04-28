@@ -56,6 +56,11 @@ namespace {
     // that only one command executes at a time, preventing races and potential
     // crashes in the COM interface layer.
     std::mutex g_dbgengMutex;
+
+    // When true, every command sent through the MCP pipe and its output are
+    // echoed to WinDbg's output window via ControlledOutput(ALL_CLIENTS).
+    // Toggle with the `mcpecho on|off` WinDbg command or the set_echo handler.
+    std::atomic<bool> g_echoEnabled{false};
 } // namespace
 
 // CommandExecutor class implementation
@@ -110,7 +115,15 @@ public:
                 
                 // Store the control interface for potential interrupt
                 *sharedControl = control;
-                
+
+                // Echo the command to WinDbg's output window if echo is enabled.
+                // Done BEFORE installing OutputCallbacks so this line is not captured.
+                if (g_echoEnabled.load(std::memory_order_relaxed)) {
+                    control->ControlledOutput(
+                        DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_OUTPUT_NORMAL,
+                        "[MCP>>] %s\n", command.c_str());
+                }
+
                 // Create our custom output callback - use CComPtr for proper management
                 CComPtr<OutputCallbacks> callbacks;
                 callbacks = new OutputCallbacks();  // Don't use Attach() - new already sets refcount to 1
@@ -131,7 +144,22 @@ public:
                 
                 // Clean up by removing our callback
                 client->SetOutputCallbacks(nullptr);
-                
+
+                // Echo the output to WinDbg's output window if echo is enabled.
+                // Done AFTER removing OutputCallbacks so the echo is not captured.
+                if (g_echoEnabled.load(std::memory_order_relaxed)) {
+                    constexpr size_t MAX_ECHO = 2048;
+                    std::string echoOut = output.size() > MAX_ECHO
+                        ? output.substr(0, MAX_ECHO) + "\n...(output truncated)\n"
+                        : output;
+                    if (echoOut.empty() || echoOut.back() != '\n') {
+                        echoOut += '\n';
+                    }
+                    control->ControlledOutput(
+                        DEBUG_OUTCTL_ALL_CLIENTS, DEBUG_OUTPUT_NORMAL,
+                        "[MCP<<] %s", echoOut.c_str());
+                }
+
                 p.set_value(CommandResult(output, hr));
                 promiseSet = true;
                 
@@ -544,6 +572,14 @@ std::string CommandUtilities::GetSessionId() {
 std::chrono::steady_clock::time_point CommandUtilities::GetLastCommandTime() {
     std::lock_guard<std::mutex> lock(s_staticMembersMutex);
     return g_lastCommandTime;
+}
+
+bool CommandUtilities::GetEchoEnabled() {
+    return g_echoEnabled.load(std::memory_order_relaxed);
+}
+
+void CommandUtilities::SetEchoEnabled(bool enabled) {
+    g_echoEnabled.store(enabled, std::memory_order_relaxed);
 }
 
 std::string CommandUtilities::GetDebuggingMode() {

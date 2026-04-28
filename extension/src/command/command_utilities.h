@@ -236,6 +236,20 @@ public:
      * @return Last command execution timepoint.
      */
     static std::chrono::steady_clock::time_point GetLastCommandTime();
+
+    // Command echo control
+
+    /**
+     * @brief Check whether command echo to WinDbg output is currently enabled.
+     * @return True if echo is on.
+     */
+    static bool GetEchoEnabled();
+
+    /**
+     * @brief Enable or disable command echo to WinDbg output window.
+     * @param enabled True to enable, false to disable.
+     */
+    static void SetEchoEnabled(bool enabled);
     
     // Command execution helper
     
