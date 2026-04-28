@@ -2,6 +2,7 @@
 #include "command/diagnostic_command_handlers.h"
 #include "command/command_utilities.h"
 #include "../ipc/mcp_server.h"  // Include MCPServer definition
+#include <atlcomcli.h>          // CComPtr, CComQIPtr
 
 void DiagnosticCommandHandlers::RegisterHandlers(MCPServer& server) {
     // Register diagnostic command handlers
