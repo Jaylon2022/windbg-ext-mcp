@@ -484,15 +484,32 @@ def register_analysis_tools(mcp: FastMCP):
     @mcp.tool()
     async def analyze_memory(ctx: Context, action: str, address: str = "", type_name: str = "", length: int = 32) -> Union[str, Dict[str, Any]]:
         """
-        Analyze memory and data structures.
-        
+        Analyze memory, data structures, and pool allocations.
+
+        **Memory leak / pool corruption workflow (Driver Verifier):**
+          - analyze_memory(action='poolused')                  — rank drivers by pool usage
+          - analyze_memory(action='poolfind', address='<tag>') — find all allocs with a tag
+          - analyze_memory(action='pool', address='<addr>')    — inspect a specific pool block
+
         Args:
             ctx: The MCP context
-            action: Action to perform - "display", "type", "search", "pte", "regions"
-            address: Memory address (required for most actions)
-            type_name: Type name for structure display (required for "type" action)
-            length: Number of bytes/elements to display (default: 32)
-            
+            action: Action to perform:
+                    "display"   - display memory as DWORDs (dd <addr> l<len>)
+                    "type"      - display a typed structure (dt <type> <addr>)
+                    "search"    - search for a byte/DWORD pattern in memory
+                                  (uses type_name as the search pattern)
+                    "pte"       - analyze Page Table Entry (!pte <addr>)
+                    "regions"   - virtual memory regions (!vm)
+                    "pool"      - analyze a pool block/allocation (!pool <addr>)
+                                  USE THIS for pool corruption bugchecks (0x19 / 0xC2)
+                    "poolused"  - list pool usage per driver, sorted by nonpaged size
+                                  USE THIS to find the driver leaking the most pool memory
+                    "poolfind"  - find all pool allocations with a given 4-char tag
+                                  (address parameter = pool tag, e.g. 'Ddk ')
+            address: Memory address (required for display/type/search/pte/pool/poolfind)
+            type_name: Type name for 'type' action, or search pattern for 'search' action
+            length: Number of bytes/DWORDs to display or search (default: 32)
+
         Returns:
             Memory analysis results
         """
@@ -534,12 +551,24 @@ def register_analysis_tools(mcp: FastMCP):
                 if not address:
                     enhanced_error = enhance_error("parameter", tool_name="analyze_memory", missing_param="address")
                     return enhanced_error.to_dict()
-                
+                if not type_name:
+                    return {
+                        "error": "'search' action requires type_name as the search pattern",
+                        "example": "analyze_memory(action='search', address='0xffff...', type_name='deadbeef', length=256)",
+                        "note": "type_name is interpreted as a hex DWORD pattern for 's -d' search"
+                    }
+
                 try:
-                    # Search for pattern in memory range
-                    search_cmd = f"s {address} L{length} {address[:8]}"  # Search for first 8 chars as pattern
+                    # s -d: search for a DWORD value in the given address range.
+                    # type_name is repurposed as the pattern to search for.
+                    search_cmd = f"s -d {address} L{length} {type_name}"
                     result = send_command(search_cmd, timeout_ms=_get_timeout(search_cmd))
-                    return {"output": result, "search_range": f"{address} L{length}"}
+                    return {
+                        "output": result,
+                        "search_range": f"{address} L{length}",
+                        "pattern": type_name,
+                        "command": search_cmd
+                    }
                 except Exception as e:
                     enhanced_error = enhance_error("execution", command=search_cmd, original_error=str(e))
                     return enhanced_error.to_dict()
@@ -565,14 +594,103 @@ def register_analysis_tools(mcp: FastMCP):
                 except Exception as e:
                     enhanced_error = enhance_error("execution", command="!vm", original_error=str(e))
                     return enhanced_error.to_dict()
+
+            elif action == "pool":
+                # Analyze a specific pool block.
+                # In pool corruption crashes (.bugcheck param2 is usually the bad pool address).
+                # Also useful after !verifier to inspect individual flagged allocations.
+                if not address:
+                    enhanced_error = enhance_error("parameter", tool_name="analyze_memory", missing_param="address")
+                    return enhanced_error.to_dict()
+                try:
+                    result = send_command(f"!pool {address}", timeout_ms=_get_timeout("!pool"))
+                    return {
+                        "output": result,
+                        "pool_address": address,
+                        "context": "Pool block analysis",
+                        "next_steps": [
+                            "Look for 'Pool tag' to identify the owning driver (4-char tag)",
+                            "'*** ERROR:' or 'BAD' lines indicate corruption",
+                            "Use analyze_memory(action='poolfind', address='<tag>') to "
+                            "find all allocations with that tag",
+                            "Use 'lm' or '!poolused' to map pool tag to a driver name"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command=f"!pool {address}", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "poolused":
+                # List pool memory usage per driver, sorted by nonpaged pool size.
+                # This is the definitive command for finding which driver is NOT freeing pool.
+                # Verifier memory leak scenario: the driver with the largest NonPaged value
+                # that should have freed on unload but didn't is the culprit.
+                try:
+                    # 4 = sort by nonpaged pool (descending) — biggest leakers first.
+                    result = send_command("!poolused 4", timeout_ms=_get_timeout("!poolused"))
+                    return {
+                        "output": result,
+                        "context": "Pool usage per driver, sorted by nonpaged pool (desc)",
+                        "note": (
+                            "The driver at the top with the largest 'Nonpaged' value is "
+                            "the primary suspect for pool leaking. Note its pool tag."
+                        ),
+                        "next_steps": [
+                            "Identify the driver with the largest NonPaged allocation",
+                            "Note its 4-char pool tag (shown in the Tag column)",
+                            "Use analyze_memory(action='poolfind', address='<tag>') "
+                            "to enumerate all outstanding allocations with that tag",
+                            "Confirm the driver with 'lm m <driver_name>'"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command="!poolused 4", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "poolfind":
+                # Find all outstanding pool allocations with a given 4-char pool tag.
+                # Use after poolused identifies the tag of the leaking driver.
+                if not address:
+                    return {
+                        "error": "'poolfind' requires address parameter as the pool tag (e.g. 'Ddk ')",
+                        "example": "analyze_memory(action='poolfind', address='Ddk ')",
+                        "note": "Pool tags are 4 characters; pad with spaces if needed"
+                    }
+                try:
+                    result = send_command(f"!poolfind {address}", timeout_ms=_get_timeout("!poolfind"))
+                    return {
+                        "output": result,
+                        "pool_tag": address,
+                        "context": f"All pool allocations with tag '{address}'",
+                        "next_steps": [
+                            "Each entry shows the pool block address and size",
+                            "Use analyze_memory(action='pool', address='<block_addr>') "
+                            "to inspect a specific block's content and allocation stack",
+                            "If Driver Verifier is enabled, allocation stacks may be available "
+                            "via 'dt nt!_POOL_TRACKER_BIG_PAGES <addr>'"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command=f"!poolfind {address}", original_error=str(e))
+                    return enhanced_error.to_dict()
                     
             else:
                 return {
                     "error": f"Unknown action: {action}",
-                    "available_actions": ["display", "type", "search", "pte", "regions"],
+                    "available_actions": ["display", "type", "search", "pte", "regions",
+                                          "pool", "poolused", "poolfind"],
+                    "memory_leak_workflow": [
+                        "1. analyze_memory(action='poolused')                   — rank drivers by NonPaged pool",
+                        "2. analyze_memory(action='poolfind', address='<tag>')  — find all allocs with tag",
+                        "3. analyze_memory(action='pool', address='<block>')    — inspect specific block"
+                    ],
                     "examples": [
                         "analyze_memory(action='display', address='0x1000')",
-                        "analyze_memory(action='type', address='0x1000', type_name='_EPROCESS')"
+                        "analyze_memory(action='type', address='0x1000', type_name='_EPROCESS')",
+                        "analyze_memory(action='search', address='0xffff0000', type_name='deadbeef', length=256)",
+                        "analyze_memory(action='pool', address='0xffff8001a2b3c000')",
+                        "analyze_memory(action='poolused')",
+                        "analyze_memory(action='poolfind', address='Ddk ')"
                     ]
                 }
                 
@@ -585,11 +703,19 @@ def register_analysis_tools(mcp: FastMCP):
         """
         Analyze kernel objects, structures, and system-wide state.
 
-        **Driver crash (bugcheck/BSOD) diagnosis workflow:**
+        **Driver Verifier crash (bugcheck 0xC4) diagnosis workflow:**
+
+          Step 1 — Auto crash analysis:   analyze_kernel(action='bugcheck')
+                     (includes !verifier automatically)
+          Step 2 — Verifier details:      analyze_kernel(action='verifier')
+          Step 3 — Find leaking driver:   analyze_memory(action='poolused')
+          Step 4 — Inspect pool block:    analyze_memory(action='pool', address='<param2 from .bugcheck>')
+
+        **General driver crash (bugcheck/BSOD) diagnosis workflow:**
 
           Step 1 — Auto crash analysis:   analyze_kernel(action='bugcheck')
           Step 2 — Identify the driver:   analyze_kernel(action='modules') + 'lm a <addr>'
-          Step 3 — If pool corruption:    run_command('!pool <addr>') with the pool address
+          Step 3 — If pool corruption:    analyze_memory(action='pool', address='<param2>')
           Step 4 — If IRP related:        run_command('!irp <addr>') with the IRP address
 
         **System hang / freeze diagnosis workflow:**
@@ -612,6 +738,9 @@ def register_analysis_tools(mcp: FastMCP):
                     "stacks"     - all non-idle kernel thread stacks system-wide (!stacks 2)
                     "locks"      - executive resource / mutex lock contention (!locks)
                     "dpcs"       - deferred procedure call queue (!dpcs)
+                    "verifier"   - Driver Verifier state + memory leak analysis
+                                   (!verifier 3 + !poolused 4). USE THIS for 0xC4 crashes
+                                   and memory leak diagnosis
                     "object"     - inspect a kernel object (!object <addr>)
                     "idt"        - Interrupt Descriptor Table (!idt)
                     "handles"    - system handles (!handle)
@@ -647,7 +776,17 @@ def register_analysis_tools(mcp: FastMCP):
                 except Exception as e:
                     crash_results.append({"step": "crash_analysis", "error": str(e)})
 
-                # Step 3: Call stack of the crashing thread (with parameters).
+                # Step 3: Driver Verifier state — ALWAYS run this.
+                # If bugcheck is 0xC4 (DRIVER_VERIFIER_DETECTED_VIOLATION) this output
+                # contains the critical violation code in param1 (e.g. 0x62 = memory leak,
+                # 0x1 = special pool, 0x52 = mismatched free).
+                try:
+                    verifier_out = send_command("!verifier", timeout_ms=_get_timeout("!verifier"))
+                    crash_results.append({"step": "verifier_state", "output": verifier_out})
+                except Exception as e:
+                    crash_results.append({"step": "verifier_state", "error": str(e)})
+
+                # Step 4: Call stack of the crashing thread (with parameters).
                 try:
                     stack_out = send_command("kP 30", timeout_ms=_get_timeout("kP"))
                     crash_results.append({"step": "crash_stack", "output": stack_out})
@@ -661,20 +800,26 @@ def register_analysis_tools(mcp: FastMCP):
                     "next_steps": [
                         "Find 'MODULE_NAME' and 'IMAGE_NAME' in crash_analysis output — that is the responsible driver",
                         "Find 'STACK_TEXT' in crash_analysis to trace the exact failure path",
-                        "Use 'lm a <address>' to identify any unknown address as a module",
+                        "If bugcheck is 0xC4 (DRIVER_VERIFIER_DETECTED_VIOLATION): "
+                        "check verifier_state output; param1 is the violation code. "
+                        "Then run analyze_kernel(action='verifier') for details, "
+                        "and analyze_memory(action='poolused') to find the leaking driver",
                         "If bugcheck is 0xC2 (BAD_POOL_CALLER) or 0x19 (BAD_POOL_HEADER): "
-                        "run run_command('!pool <addr>') with the pool address from .bugcheck params",
+                        "run analyze_memory(action='pool', address='<param2_from_bugcheck>')",
                         "If bugcheck is 0xD1 (DRIVER_IRQL_NOT_LESS_OR_EQUAL): the driver is "
                         "accessing paged memory at elevated IRQL — see STACK_TEXT for the driver",
                         "If bugcheck is 0x7E or 0x8E (unexpected kernel exception): check "
                         "EXCEPTION_CODE and the faulting instruction in STACK_TEXT",
+                        "Use 'lm a <address>' to identify any unknown address as a module",
                         "Use analyze_kernel(action='modules') then 'lm a <addr>' to confirm the driver"
                     ],
                     "common_bugchecks": {
                         "0x0000000A (IRQL_NOT_LESS_OR_EQUAL)": "Driver accessing paged memory at elevated IRQL",
                         "0x0000001E (KMODE_EXCEPTION_NOT_HANDLED)": "Unhandled kernel exception, check STOP parameters",
-                        "0x00000019 (BAD_POOL_HEADER)": "Pool corruption — run !pool with param2",
-                        "0x000000C2 (BAD_POOL_CALLER)": "Invalid pool allocation — run !pool with param2",
+                        "0x00000019 (BAD_POOL_HEADER)": "Pool corruption — use analyze_memory(action='pool', address='<param2>')",
+                        "0x000000C2 (BAD_POOL_CALLER)": "Invalid pool allocation — use analyze_memory(action='pool', address='<param2>')",
+                        "0x000000C4 (DRIVER_VERIFIER_DETECTED_VIOLATION)": "Verifier triggered — check verifier_state step; param1 violation codes: 0x62=memory leak, 0x1=special pool, 0x52=mismatched free",
+                        "0x000000E6 (DRIVER_VERIFIER_DMA_VIOLATION)": "DMA violation detected by Driver Verifier",
                         "0x000000D1 (DRIVER_IRQL_NOT_LESS_OR_EQUAL)": "Driver IRQL violation",
                         "0x000000FC (ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY)": "DEP violation in driver",
                         "0x00000050 (PAGE_FAULT_IN_NONPAGED_AREA)": "Invalid memory access in driver",
@@ -798,6 +943,64 @@ def register_analysis_tools(mcp: FastMCP):
                     enhanced_error = enhance_error("execution", command="!dpcs", original_error=str(e))
                     return enhanced_error.to_dict()
 
+            elif action == "verifier":
+                # Driver Verifier state and memory leak analysis.
+                # Primary use case: system crashed with bugcheck 0xC4
+                # (DRIVER_VERIFIER_DETECTED_VIOLATION) or memory leaks are suspected.
+                verifier_results = []
+
+                # Step 1: Verifier flags + per-driver statistics.
+                # !verifier 3 = FLAGS(1) | STATISTICS(2): shows what verifier checks are
+                # enabled and how many violations each driver caused.
+                try:
+                    v3_out = send_command("!verifier 3", timeout_ms=_get_timeout("!verifier"))
+                    verifier_results.append({"step": "verifier_flags_and_stats", "output": v3_out})
+                except Exception as e:
+                    verifier_results.append({"step": "verifier_flags_and_stats", "error": str(e)})
+
+                # Step 2: Pool usage sorted by nonpaged pool size (descending).
+                # !poolused 4 reveals which driver has allocated the most nonpaged pool
+                # without freeing it — the top entry is almost always the leaking driver.
+                try:
+                    pu_out = send_command("!poolused 4", timeout_ms=_get_timeout("!poolused"))
+                    verifier_results.append({"step": "pool_usage_by_nonpaged", "output": pu_out})
+                except Exception as e:
+                    verifier_results.append({"step": "pool_usage_by_nonpaged", "error": str(e)})
+
+                # Step 3: Verifier driver list — shows exactly which drivers are under test.
+                try:
+                    v4_out = send_command("!verifier 4", timeout_ms=_get_timeout("!verifier"))
+                    verifier_results.append({"step": "verified_drivers", "output": v4_out})
+                except Exception as e:
+                    verifier_results.append({"step": "verified_drivers", "error": str(e)})
+
+                return {
+                    "success": True,
+                    "context": "Driver Verifier state and memory leak analysis",
+                    "steps": verifier_results,
+                    "next_steps": [
+                        "In pool_usage_by_nonpaged: the driver at the top with the largest "
+                        "'Nonpaged' allocation is the leaking driver",
+                        "Note the 4-char pool tag next to the driver name — use "
+                        "analyze_memory(action='poolfind', address='<tag>') to find all allocations",
+                        "In verifier_flags_and_stats: look for drivers with non-zero "
+                        "'CurrentPagedPoolAllocations' or 'CurrentNonPagedPoolAllocations' "
+                        "at shutdown/crash time",
+                        "Use analyze_memory(action='pool', address='<pool_addr>') to inspect "
+                        "a specific pool block from the .bugcheck parameters",
+                        "If verifier_flags_and_stats shows 0xC4 violation code 0x62: this IS "
+                        "a memory leak — the driver allocated pool and didn't free it on unload"
+                    ],
+                    "verifier_violation_codes": {
+                        "0x00000001": "Special pool: corrupted allocations adjacent to block",
+                        "0x00000052": "Mismatched free (ExFreePool type != allocation type)",
+                        "0x00000062": "Memory leak on driver unload (pool not freed)",
+                        "0x00000063": "Memory leak on driver unload (contiguous memory not freed)",
+                        "0x00000064": "Memory leak on driver unload (common buffer not freed)",
+                        "0x00000065": "Memory leak on driver unload (MDL not freed)"
+                    }
+                }
+
             elif action == "object":
                 if not address:
                     enhanced_error = enhance_error("parameter", tool_name="analyze_kernel", missing_param="address")
@@ -854,13 +1057,19 @@ def register_analysis_tools(mcp: FastMCP):
                 return {
                     "error": f"Unknown action: {action}",
                     "available_actions": [
-                        "bugcheck", "analyze", "running", "stacks", "locks", "dpcs",
+                        "bugcheck", "analyze", "verifier", "running", "stacks", "locks", "dpcs",
                         "object", "idt", "handles", "interrupts", "modules"
                     ],
+                    "verifier_crash_workflow": [
+                        "1. analyze_kernel(action='bugcheck')   — auto crash analysis (includes !verifier)",
+                        "2. analyze_kernel(action='verifier')   — verifier state + !poolused 4 leak ranking",
+                        "3. analyze_memory(action='poolused')   — full pool usage by driver",
+                        "4. analyze_memory(action='pool', address='<param2>') — inspect specific pool block"
+                    ],
                     "crash_diagnosis_workflow": [
-                        "1. analyze_kernel(action='bugcheck')  — .bugcheck + !analyze -v + kP (FOR BSOD/CRASH)",
+                        "1. analyze_kernel(action='bugcheck')  — .bugcheck + !analyze -v + !verifier + kP",
                         "2. analyze_kernel(action='modules')   — lm to identify driver by address",
-                        "3. run_command('!pool <addr>')        — if pool corruption bugcheck",
+                        "3. analyze_memory(action='pool', address='<addr>') — if pool corruption bugcheck",
                         "4. run_command('!irp <addr>')         — if IRP-related crash"
                     ],
                     "hang_diagnosis_workflow": [
