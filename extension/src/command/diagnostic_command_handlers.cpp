@@ -3,6 +3,7 @@
 #include "command/command_utilities.h"
 #include "../ipc/mcp_server.h"  // Include MCPServer definition
 #include <atlcomcli.h>          // CComPtr, CComQIPtr
+#include <sstream>              // std::ostringstream
 
 void DiagnosticCommandHandlers::RegisterHandlers(MCPServer& server) {
     // Register diagnostic command handlers
