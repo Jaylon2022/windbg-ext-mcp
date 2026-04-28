@@ -1,12 +1,13 @@
 #include "pch.h"
 #include "ipc/mcp_server.h"
 #include <sstream>
+#include <sddl.h>       // ConvertStringSecurityDescriptorToSecurityDescriptorA
 #include <WDBGEXTS.H>
 
 // Buffer size for reading from the pipe
 constexpr DWORD BUFFER_SIZE = 4096;
 
-MCPServer::MCPServer() : m_running(false) {
+MCPServer::MCPServer() : m_running(false), m_stopEvent(NULL) {
 }
 
 MCPServer::~MCPServer() {
@@ -33,12 +34,16 @@ void MCPServer::Stop() {
         return;
         
     m_running = false;
+
+    // Signal the stop event so PipeServerThread wakes up from ConnectNamedPipe
+    if (m_stopEvent) {
+        SetEvent(m_stopEvent);
+    }
     
-    // Wake up all client threads
+    // Mark all clients as inactive so their handler threads exit
     {
         std::lock_guard<std::mutex> lock(m_clientsMutex);
         for (auto& client : m_clients) {
-            client->queueCondition.notify_all();
             client->active = false;
         }
     }
@@ -92,18 +97,52 @@ bool MCPServer::BroadcastMessage(const json& message) {
 }
 
 HANDLE MCPServer::CreatePipeInstance() {
-    // Create a new pipe instance with message-read mode
+    // Build a security descriptor that restricts pipe access to the process
+    // owner, SYSTEM, and the Administrators group.  NULL security attributes
+    // would allow any local process to connect and issue arbitrary WinDbg
+    // commands, which is a significant privilege-escalation risk given that
+    // this extension can manipulate kernel state.
+    //
+    // SDDL breakdown:
+    //   D:P             – protected DACL (no inheritance from parent)
+    //   (A;;GA;;;OW)    – GENERIC_ALL to the object owner (the WinDbg process)
+    //   (A;;GA;;;SY)    – GENERIC_ALL to SYSTEM
+    //   (A;;GA;;;BA)    – GENERIC_ALL to BUILTIN\Administrators
+    SECURITY_ATTRIBUTES sa = {};
+    PSECURITY_DESCRIPTOR pSD = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)",
+            SDDL_REVISION_1,
+            &pSD,
+            nullptr)) {
+        dprintf("MCPServer: Failed to create security descriptor (error %d). Using default.\n", GetLastError());
+        pSD = nullptr;
+    }
+
+    if (pSD) {
+        sa.nLength              = sizeof(sa);
+        sa.lpSecurityDescriptor = pSD;
+        sa.bInheritHandle       = FALSE;
+    }
+
+    // Create a new pipe instance with overlapped (async) I/O so ConnectNamedPipe
+    // can be cancelled when Stop() is called.
     HANDLE hPipe = CreateNamedPipeA(
         m_pipeName.c_str(),                // Pipe name
-        PIPE_ACCESS_DUPLEX,                // Read/write access
+        PIPE_ACCESS_DUPLEX |               // Read/write access
+        FILE_FLAG_OVERLAPPED,              // Overlapped mode – allows cancellation
         PIPE_TYPE_MESSAGE |                // Message type pipe
         PIPE_READMODE_MESSAGE |            // Message-read mode
         PIPE_WAIT,                         // Blocking mode
         PIPE_UNLIMITED_INSTANCES,          // Max instances
         BUFFER_SIZE,                       // Output buffer size
         BUFFER_SIZE,                       // Input buffer size
-        0,                                 // Default time-out (50 ms)
-        NULL);                             // Default security attributes
+        0,                                 // Default time-out
+        pSD ? &sa : nullptr);              // Restricted security attributes
+
+    if (pSD) {
+        LocalFree(pSD);
+    }
 
     if (hPipe == INVALID_HANDLE_VALUE) {
         dprintf("MCPServer: CreateNamedPipe failed with error %d\n", GetLastError());
@@ -113,41 +152,91 @@ HANDLE MCPServer::CreatePipeInstance() {
 }
 
 void MCPServer::PipeServerThread() {
+    // Event used to cancel the pending ConnectNamedPipe when Stop() is called.
+    HANDLE hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!hStopEvent) {
+        dprintf("MCPServer: Failed to create stop event, error %d\n", GetLastError());
+        return;
+    }
+    m_stopEvent = hStopEvent;
+
     while (m_running) {
-        // Create a pipe instance
+        // Create a pipe instance (overlapped mode)
         HANDLE hPipe = CreatePipeInstance();
         if (hPipe == INVALID_HANDLE_VALUE) {
-            // Failed to create pipe, sleep and retry
             Sleep(1000);
             continue;
         }
 
-        // Wait for a client to connect
+        // Issue an overlapped ConnectNamedPipe so we can wake up on Stop()
+        OVERLAPPED ov = {};
+        ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        if (!ov.hEvent) {
+            CloseHandle(hPipe);
+            break;
+        }
+
         dprintf("MCPServer: Waiting for client connection on %s\n", m_pipeName.c_str());
-        BOOL connected = ConnectNamedPipe(hPipe, NULL) ? TRUE : (GetLastError() == ERROR_PIPE_CONNECTED);
-        
+        BOOL connected = ConnectNamedPipe(hPipe, &ov);
+        DWORD err = GetLastError();
+
+        if (!connected) {
+            if (err == ERROR_IO_PENDING) {
+                // Wait for either a client or the stop signal
+                HANDLE waitHandles[2] = { ov.hEvent, hStopEvent };
+                DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+
+                if (waitResult == WAIT_OBJECT_0) {
+                    // ConnectNamedPipe completed – check result
+                    DWORD transferred = 0;
+                    connected = GetOverlappedResult(hPipe, &ov, &transferred, FALSE);
+                    if (!connected) {
+                        err = GetLastError();
+                        if (err != ERROR_PIPE_CONNECTED) {
+                            CloseHandle(ov.hEvent);
+                            CloseHandle(hPipe);
+                            continue;
+                        }
+                        connected = TRUE;
+                    }
+                } else {
+                    // Stop was signalled – cancel pending I/O and exit
+                    CancelIoEx(hPipe, &ov);
+                    WaitForSingleObject(ov.hEvent, INFINITE);
+                    CloseHandle(ov.hEvent);
+                    CloseHandle(hPipe);
+                    break;
+                }
+            } else if (err == ERROR_PIPE_CONNECTED) {
+                connected = TRUE;
+            } else {
+                CloseHandle(ov.hEvent);
+                CloseHandle(hPipe);
+                continue;
+            }
+        }
+
+        CloseHandle(ov.hEvent);
+
         if (connected) {
             dprintf("MCPServer: New client connected\n");
-            
-            // Create a new client connection
+
             auto client = std::make_shared<ClientConnection>(hPipe);
-            
-            // Start a thread to handle this client
             client->thread = std::thread(&MCPServer::HandleClient, this, client);
-            
-            // Add to clients list
+
             {
                 std::lock_guard<std::mutex> lock(m_clientsMutex);
                 m_clients.push_back(client);
             }
-            
-            // Clean up any disconnected clients
+
             CleanupDisconnectedClients();
         } else {
-            // Failed to connect, close pipe and retry
             CloseHandle(hPipe);
         }
     }
+
+    CloseHandle(hStopEvent);
+    m_stopEvent = NULL;
 
     // Clean up all clients when shutting down
     CleanupDisconnectedClients();
@@ -181,37 +270,29 @@ void MCPServer::HandleClient(std::shared_ptr<ClientConnection> client) {
     
     // Keep processing until client disconnects or server stops
     while (m_running && client->active) {
-        // Process outgoing messages first
+        // Drain and send any queued outgoing messages (non-blocking check)
         {
             std::unique_lock<std::mutex> lock(client->queueMutex);
-            
-            // Wait for outgoing messages with a timeout
-            client->queueCondition.wait_for(lock, std::chrono::milliseconds(100), 
-                [&client] { return !client->outgoingMessages.empty() || !client->active; });
-            
-            // Check if we have messages to send
-            if (!client->outgoingMessages.empty()) {
+            while (!client->outgoingMessages.empty()) {
                 json message = client->outgoingMessages.front();
                 client->outgoingMessages.pop();
                 lock.unlock();
-                
-                // Serialize the message
+
                 std::string messageStr = message.dump() + "\n";
-                
-                // Send the message
                 DWORD bytesWritten;
                 BOOL success = WriteFile(
-                    client->hPipe,           // Pipe handle
-                    messageStr.c_str(),      // Message buffer
-                    (DWORD)messageStr.size(),// Message size
-                    &bytesWritten,           // Bytes written
-                    NULL);                   // Not overlapped
-                
+                    client->hPipe,
+                    messageStr.c_str(),
+                    (DWORD)messageStr.size(),
+                    &bytesWritten,
+                    NULL);
+
                 if (!success || bytesWritten != messageStr.size()) {
                     dprintf("MCPServer: Failed to write to pipe, error %d\n", GetLastError());
                     client->active = false;
-                    return; // Disconnect on error
+                    return;
                 }
+                lock.lock();
             }
         }
         

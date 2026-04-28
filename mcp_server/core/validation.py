@@ -12,20 +12,27 @@ logger = logging.getLogger(__name__)
 # Maximum allowed command length
 MAX_COMMAND_LENGTH = 4096
 
-# Commands that could terminate the debugging session or cause damage
+# Commands that will unconditionally terminate the debugging session or quit WinDbg.
+# Keep this list minimal – only commands with no legitimate automated use.
 DANGEROUS_COMMANDS = {
-    # Quit commands
+    # Quit / detach – these end the session entirely
     "q", "qq", "qd",
-    # Session termination
-    ".kill", ".detach", ".restart",
-    # File operations without proper paths
-    ".dump", ".dumpexr", ".dumpcab",
-    # Potentially dangerous loads
-    ".load", ".unload",
-    # Connection changes
+    # Kill the target process/VM – irreversible
+    ".kill",
+    # Silently detaches without allowing target to clean up
+    ".detach",
+    # Connection hijacking
     ".connect", ".server",
-    # Log operations without paths
-    ".logopen", ".logappend"
+}
+
+# Commands that require an explicit path argument to be safe.
+# Without a path argument they write to an implicit/current location, which
+# can overwrite important files; so we allow them only when a path is supplied.
+_REQUIRES_PATH_ARGUMENT = {
+    ".dump", ".dumpexr", ".dumpcab",
+    ".load", ".unload",
+    ".logopen", ".logappend",
+    ".restart",
 }
 
 # Commands that are always safe for kernel debugging
@@ -88,9 +95,19 @@ def validate_command(command: str) -> Tuple[bool, Optional[str]]:
     
     base_command = command_parts[0].lower()
     
-    # Check if it's a dangerous command
+    # Unconditionally dangerous – these end or hijack the session
     if base_command in DANGEROUS_COMMANDS:
-        return False, f"Command '{base_command}' is restricted for safety. It could terminate the debugging session or cause system damage."
+        return False, f"Command '{base_command}' is restricted for safety. It could terminate the debugging session."
+
+    # Commands that are only safe when an explicit argument (path/target) is given
+    if base_command in _REQUIRES_PATH_ARGUMENT:
+        if len(command_parts) < 2:
+            return False, (
+                f"Command '{base_command}' requires an explicit argument (e.g. a file path) "
+                f"to be safe. Bare '{base_command}' is not allowed."
+            )
+        # Has an argument – allow it
+        return True, None
     
     # Check if it starts with a safe prefix
     for safe_prefix in ALWAYS_SAFE_PREFIXES:
@@ -144,10 +161,15 @@ def is_safe_for_automation(command: str) -> bool:
     
     command = command.strip().lower()
     
-    # Never allow dangerous commands that could terminate sessions or cause damage
+    # Never allow unconditionally dangerous commands
     base_command = command.split()[0] if command.split() else ""
     if base_command in DANGEROUS_COMMANDS:
         return False
+
+    # Commands that need a path argument are allowed for automation only when one is provided
+    if base_command in _REQUIRES_PATH_ARGUMENT:
+        parts = command.split()
+        return len(parts) >= 2
     
     # CHANGED: Now allow execution control commands for LLM automation
     # These are essential for interactive debugging workflows

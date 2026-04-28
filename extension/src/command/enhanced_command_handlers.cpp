@@ -98,6 +98,8 @@ json EnhancedCommandHandlers::ExecuteCommandHandler(const json& message) {
             }
             
             // Check for breakpoint and execution control commands that return empty output on success
+            // NOTE: Use exact match or require trailing space to avoid matching extension commands
+            // e.g. "p" must not match "!process"; "t" must not match "!thread"
             if (lowerCommand.find("bp ") == 0 ||           // Set breakpoint
                 lowerCommand.find("ba ") == 0 ||           // Set access breakpoint  
                 lowerCommand.find("bu ") == 0 ||           // Set unresolved breakpoint
@@ -106,10 +108,24 @@ json EnhancedCommandHandlers::ExecuteCommandHandler(const json& message) {
                 lowerCommand.find("g ") == 0 ||            // Go with address
                 lowerCommand == "gh" ||                    // Go with exception handled
                 lowerCommand == "gn" ||                    // Go with exception not handled
-                lowerCommand.find("gu") == 0 ||            // Go up (until return)
-                lowerCommand.find("p") == 0 ||             // Step/trace commands
-                lowerCommand.find("t") == 0 ||             // Step/trace commands
+                lowerCommand == "gu" ||                    // Go up (until return), exact match
+                lowerCommand.find("gu ") == 0 ||           // Go up with options
+                lowerCommand == "p" ||                     // Step over (exact)
+                lowerCommand.find("p ") == 0 ||            // Step over with count/options
+                lowerCommand == "pa" ||                    // Step to address
+                lowerCommand.find("pa ") == 0 ||
+                lowerCommand == "pc" ||                    // Step to next call
+                lowerCommand == "pt" ||                    // Step to next return
+                lowerCommand == "t" ||                     // Step into (exact)
+                lowerCommand.find("t ") == 0 ||            // Step into with count/options
+                lowerCommand == "ta" ||                    // Trace to address
+                lowerCommand.find("ta ") == 0 ||
+                lowerCommand == "tc" ||                    // Trace to next call
+                lowerCommand == "tt" ||                    // Trace to next return
+                lowerCommand == "wt" ||                    // Trace and watch
+                lowerCommand.find("wt ") == 0 ||
                 lowerCommand.find("bc ") == 0 ||           // Clear breakpoint
+                lowerCommand == "bc *" ||                  // Clear all breakpoints
                 lowerCommand.find("bd ") == 0 ||           // Disable breakpoint
                 lowerCommand.find("be ") == 0 ||           // Enable breakpoint
                 lowerCommand.find(".restart") == 0 ||      // Restart target
@@ -137,7 +153,19 @@ json EnhancedCommandHandlers::ExecuteCommandHandler(const json& message) {
                 } else if (lowerCommand == "g" || lowerCommand.find("g ") == 0 || 
                           lowerCommand == "gh" || lowerCommand == "gn") {
                     output = "Execution continued.";
-                } else if (lowerCommand.find("bc ") == 0) {
+                } else if (lowerCommand == "gu" || lowerCommand.find("gu ") == 0) {
+                    output = "Execution continued (go up).";
+                } else if (lowerCommand == "p" || lowerCommand.find("p ") == 0 ||
+                           lowerCommand == "pa" || lowerCommand.find("pa ") == 0 ||
+                           lowerCommand == "pc" || lowerCommand == "pt") {
+                    output = "Step command completed.";
+                } else if (lowerCommand == "t" || lowerCommand.find("t ") == 0 ||
+                           lowerCommand == "ta" || lowerCommand.find("ta ") == 0 ||
+                           lowerCommand == "tc" || lowerCommand == "tt") {
+                    output = "Trace command completed.";
+                } else if (lowerCommand == "wt" || lowerCommand.find("wt ") == 0) {
+                    output = "Trace and watch completed.";
+                } else if (lowerCommand.find("bc ") == 0 || lowerCommand == "bc *") {
                     output = "Breakpoint cleared successfully.";
                 } else if (lowerCommand.find("bd ") == 0) {
                     output = "Breakpoint disabled successfully.";

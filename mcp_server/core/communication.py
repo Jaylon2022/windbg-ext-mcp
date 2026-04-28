@@ -8,6 +8,7 @@ import json
 import time
 import logging
 import threading
+import itertools
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 from dataclasses import dataclass
@@ -196,6 +197,18 @@ class NamedPipeProtocol:
                 logger.warning(f"Error closing pipe handle: {e}")
 
 
+# Thread-safe monotonic message ID counter – avoids collisions when multiple
+# threads call create_command_message / create_handler_message in the same
+# millisecond (which would produce identical int(time.time()*1000) values).
+_msg_id_counter = itertools.count(1)
+_msg_id_lock = threading.Lock()
+
+def _next_msg_id() -> int:
+    """Return a process-unique, monotonically increasing message ID."""
+    with _msg_id_lock:
+        return next(_msg_id_counter)
+
+
 class MessageProtocol:
     """Handles message-level protocol for MCP communication."""
     
@@ -205,7 +218,7 @@ class MessageProtocol:
         return {
             "type": "command",
             "command": "execute_command",
-            "id": int(time.time() * 1000),
+            "id": _next_msg_id(),
             "args": {
                 "command": command,
                 "timeout_ms": timeout_ms
@@ -218,7 +231,7 @@ class MessageProtocol:
         message = {
             "type": "command",
             "command": handler_name,
-            "id": int(time.time() * 1000)
+            "id": _next_msg_id()
         }
         
         if kwargs:
@@ -274,12 +287,22 @@ class MessageProtocol:
     @staticmethod
     def detect_network_debugging_error(error_message: str) -> bool:
         """Detect if an error message indicates network debugging issues."""
-        network_error_indicators = [
-            "retry sending", "transport connection", "lost", "network",
-            "target windows seems lost", "resync with target"
+        msg_lower = error_message.lower()
+
+        # Exact / phrase-level indicators – ordered from most to least specific.
+        # Avoid single words like "lost" or "network" that appear in many
+        # non-network error messages (e.g. "symbol path information was lost").
+        network_error_phrases = [
+            "retry sending",
+            "transport connection",
+            "target windows seems lost",
+            "resync with target",
+            "network debugging",
+            "kdnet",
+            "dbgeng transport",
         ]
-        
-        return any(phrase in error_message.lower() for phrase in network_error_indicators)
+
+        return any(phrase in msg_lower for phrase in network_error_phrases)
 
 
 # Connection Pool Management
@@ -325,11 +348,40 @@ class ConnectionPool:
                 self._active_requests -= 1
                 self._queue_condition.notify_all()
     
+    @staticmethod
+    def _is_handle_alive(handle) -> bool:
+        """Probe whether a pooled pipe handle is still usable."""
+        try:
+            import win32pipe
+            # PeekNamedPipe with zero buffer is a cheap liveness check:
+            # it succeeds (or returns ERROR_NO_DATA) for live pipes and
+            # raises an error for broken ones.
+            win32pipe.PeekNamedPipe(handle, 0)
+            return True
+        except Exception:
+            return False
+
+    def _evict_stale_connections(self):
+        """Remove connections that are no longer alive from the pool (call with lock held)."""
+        live = []
+        for conn in self._connections:
+            if conn.in_use:
+                live.append(conn)  # Don't probe in-use connections
+            elif self._is_handle_alive(conn.handle):
+                live.append(conn)
+            else:
+                logger.debug("Evicting stale connection from pool")
+                NamedPipeProtocol.close_pipe(conn.handle)
+        self._connections = live
+
     def _acquire_connection(self, timeout_ms: int) -> ConnectionHandle:
         """Acquire a connection from the pool."""
         current_thread = threading.get_ident()
         
         with self._lock:
+            # Evict any connections that dropped while idle
+            self._evict_stale_connections()
+
             for conn in self._connections:
                 if not conn.in_use:
                     conn.in_use = True
@@ -375,16 +427,28 @@ class ConnectionPool:
     def _release_connection(self, connection: ConnectionHandle):
         """Release connection back to pool."""
         with self._lock:
-            connection.in_use = False
-            connection.last_used = datetime.now()
-            connection.thread_id = 0
-            
             if connection not in self._connections:
+                # Temporary connection - always close immediately
                 try:
                     NamedPipeProtocol.close_pipe(connection.handle)
                     logger.debug("Closed temporary connection")
                 except Exception as e:
                     logger.warning(f"Error closing temporary connection: {e}")
+                return
+
+            # Pooled connection - check if it's still alive before returning it
+            if self._is_handle_alive(connection.handle):
+                connection.in_use = False
+                connection.last_used = datetime.now()
+                connection.thread_id = 0
+            else:
+                # Pipe broke during the request; evict it so the pool stays healthy
+                logger.warning("Pooled connection broke during use, evicting")
+                self._connections.remove(connection)
+                try:
+                    NamedPipeProtocol.close_pipe(connection.handle)
+                except Exception:
+                    pass
     
     def get_stats(self) -> Dict[str, Any]:
         """Get connection pool statistics."""

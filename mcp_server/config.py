@@ -133,7 +133,9 @@ TIMEOUT_MULTIPLIERS = {
 
 # Commands by timeout category
 QUICK_COMMANDS = {"version", "help", "?", "r"}
-NORMAL_COMMANDS = {"lm", "k", "dv", "dt"}
+# NOTE: "lm" is deliberately NOT in QUICK_COMMANDS – module listing can be slow
+# in kernel sessions with many drivers and belongs in BULK_COMMANDS.
+NORMAL_COMMANDS = {"k", "dv", "dt"}
 ANALYSIS_COMMANDS = {"!analyze", "!thread", "!process"}
 MEMORY_COMMANDS = {"dd", "dq", "dp", "da", "du"}
 EXECUTION_COMMANDS = {"g", "p", "t", "bp", "bc"}

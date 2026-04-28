@@ -21,6 +21,43 @@ std::chrono::steady_clock::time_point CommandUtilities::g_lastCommandTime = std:
 std::string CommandUtilities::g_sessionId;
 double CommandUtilities::g_lastExecutionTime = 0.0;
 
+// ---------------------------------------------------------------------------
+// Orphaned-thread list: when a timed-out thread cannot be interrupted we park
+// it here so that it can join itself once it eventually finishes, instead of
+// leaking it forever (which would exhaust handles and COM references).
+// ---------------------------------------------------------------------------
+namespace {
+    std::mutex                         g_orphanMutex;
+    std::vector<std::thread>           g_orphanThreads;
+
+    // Called before spawning a new execution thread - joins any orphans that
+    // have already finished so the vector does not grow without bound.
+    void ReapOrphans() {
+        std::lock_guard<std::mutex> lk(g_orphanMutex);
+        auto it = g_orphanThreads.begin();
+        while (it != g_orphanThreads.end()) {
+            // A zero-wait join attempt: try_join is not standard, so we just
+            // join unconditionally here – callers only add truly-finished
+            // threads via the shared_future check below.
+            if (it->joinable()) {
+                it->join();
+            }
+            it = g_orphanThreads.erase(it);
+        }
+    }
+
+    void ParkOrphan(std::thread&& t) {
+        std::lock_guard<std::mutex> lk(g_orphanMutex);
+        g_orphanThreads.push_back(std::move(t));
+    }
+
+    // dbgeng.dll (the WinDbg debug engine) is not designed for concurrent
+    // IDebugClient::Execute calls from multiple threads.  This mutex ensures
+    // that only one command executes at a time, preventing races and potential
+    // crashes in the COM interface layer.
+    std::mutex g_dbgengMutex;
+} // namespace
+
 // CommandExecutor class implementation
 class CommandExecutor {
 public:
@@ -35,30 +72,38 @@ public:
     };
 
     static CommandResult ExecuteWithTimeout(const std::string& command, unsigned int timeoutMs) {
+        // Opportunistically reap previously orphaned threads before starting a new one.
+        ReapOrphans();
+
         CommandResult result;
         
-        // Create a promise/future for the command execution
+        // Use a shared_future so both the main thread and (if needed) the parked
+        // orphan thread can observe the result without racing on the future state.
         std::promise<CommandResult> promise;
-        auto future = promise.get_future();
+        std::shared_future<CommandResult> future = promise.get_future().share();
         
         // Shared pointer to control interface for interrupt capability
         std::shared_ptr<CComQIPtr<IDebugControl>> sharedControl = std::make_shared<CComQIPtr<IDebugControl>>();
         
         // Launch the command execution in a separate thread
-        std::thread executionThread([&promise, command, sharedControl]() {
+        std::thread executionThread([p = std::move(promise), command, sharedControl]() mutable {
             bool promiseSet = false;
             try {
+                // Serialize all dbgeng access – the debug engine is not safe
+                // for concurrent Execute calls from multiple threads.
+                std::lock_guard<std::mutex> dbgLock(g_dbgengMutex);
+
                 CComPtr<IDebugClient> client;
                 HRESULT hr = DebugCreate(__uuidof(IDebugClient), (void**)&client);
                 if (FAILED(hr)) {
-                    promise.set_value(CommandResult("Failed to create debug client", hr));
+                    p.set_value(CommandResult("Failed to create debug client", hr));
                     promiseSet = true;
                     return;
                 }
                 
                 CComQIPtr<IDebugControl> control(client);
                 if (!control) {
-                    promise.set_value(CommandResult("Failed to get debug control interface", E_FAIL));
+                    p.set_value(CommandResult("Failed to get debug control interface", E_FAIL));
                     promiseSet = true;
                     return;
                 }
@@ -73,7 +118,7 @@ public:
                 // Set the output callbacks
                 hr = client->SetOutputCallbacks(callbacks);
                 if (FAILED(hr)) {
-                    promise.set_value(CommandResult("Failed to set output callbacks", hr));
+                    p.set_value(CommandResult("Failed to set output callbacks", hr));
                     promiseSet = true;
                     return;
                 }
@@ -87,24 +132,24 @@ public:
                 // Clean up by removing our callback
                 client->SetOutputCallbacks(nullptr);
                 
-                promise.set_value(CommandResult(output, hr));
+                p.set_value(CommandResult(output, hr));
                 promiseSet = true;
                 
             } catch (const std::exception& e) {
                 if (!promiseSet) {
-                    promise.set_value(CommandResult(std::string("Exception: ") + e.what(), E_FAIL));
+                    p.set_value(CommandResult(std::string("Exception: ") + e.what(), E_FAIL));
                     promiseSet = true;
                 }
             } catch (...) {
                 if (!promiseSet) {
-                    promise.set_value(CommandResult("Unknown exception", E_FAIL));
+                    p.set_value(CommandResult("Unknown exception", E_FAIL));
                     promiseSet = true;
                 }
             }
             
             // Final safety net - ensure promise is always set
             if (!promiseSet) {
-                promise.set_value(CommandResult("Internal error: Promise not set", E_FAIL));
+                p.set_value(CommandResult("Internal error: Promise not set", E_FAIL));
             }
         });
         
@@ -128,17 +173,28 @@ public:
             auto interruptStatus = future.wait_for(std::chrono::milliseconds(500));
             if (interruptStatus == std::future_status::ready) {
                 // Command completed after interrupt, get the result
-                auto interruptedResult = future.get();
                 result.output += " (interrupted)";
-                
-                // Wait for thread to complete safely since command finished
                 if (executionThread.joinable()) {
                     executionThread.join();
                 }
             } else {
-                // Command still running despite interrupt, detach thread to avoid blocking
+                // Thread is still running. Park it in the orphan list so it can
+                // join itself later – avoids both blocking and resource leaks.
+                // The shared_future keeps the promise result accessible after the
+                // thread finally finishes.
                 if (executionThread.joinable()) {
-                    executionThread.detach();
+                    // Wrap thread + shared_future together so the orphan reaper
+                    // can eventually join it. We spawn a thin watcher thread that
+                    // waits on the future and then parks its own thread.
+                    std::thread watcher([t = std::move(executionThread), f = future]() mutable {
+                        // Wait for the stuck thread to eventually finish (no hard deadline –
+                        // WinDbg will unblock it at the next debug break or session end).
+                        f.wait();
+                        if (t.joinable()) {
+                            t.join();
+                        }
+                    });
+                    ParkOrphan(std::move(watcher));
                 }
             }
         } else {

@@ -148,6 +148,7 @@ private:
     std::string m_pipeName;                                 ///< Name of the named pipe
     std::atomic<bool> m_running{false};                     ///< Flag indicating if the server is running
     std::thread m_serverThread;                             ///< Server thread
+    std::atomic<HANDLE> m_stopEvent{NULL};                  ///< Event signalled by Stop() to unblock ConnectNamedPipe
     
     std::map<std::string, MessageHandler> m_handlers;       ///< Message handlers for different commands
     

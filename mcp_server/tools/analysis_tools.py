@@ -170,17 +170,27 @@ def register_analysis_tools(mcp: FastMCP):
             elif action == "restore":
                 try:
                     success = context_mgr.pop_context(send_command)
-                    if success:
-                        error_enhancer.update_context(DebugContext.UNKNOWN)  # Reset context
-                        result = send_command("!peb", timeout_ms=_get_timeout("!peb"))
-                        return {"success": True, "message": "Context restored", "current_context": result[:200]}
-                    else:
+                    if not success:
                         return {"success": False, "message": "No saved context to restore"}
-                except (CommunicationError, TimeoutError) as e:
-                    enhanced_error = enhance_error("timeout", command="!peb", timeout_ms=_get_timeout("!peb"))
-                    return enhanced_error.to_dict()
+
+                    error_enhancer.update_context(DebugContext.UNKNOWN)  # Reset context
+
+                    # Use mode-appropriate command to confirm the restored context.
+                    # !peb is a user-mode only command and fails in kernel debugging.
+                    if detect_kernel_mode():
+                        verify_cmd = "!pcr"
+                    else:
+                        verify_cmd = "!peb"
+
+                    try:
+                        result = send_command(verify_cmd, timeout_ms=_get_timeout(verify_cmd))
+                        return {"success": True, "message": "Context restored", "current_context": result[:200]}
+                    except Exception:
+                        # Verification failure is non-fatal; the context was already restored
+                        return {"success": True, "message": "Context restored (verification unavailable)"}
+
                 except Exception as e:
-                    enhanced_error = enhance_error("execution", command="!peb", original_error=str(e))
+                    enhanced_error = enhance_error("execution", command="restore", original_error=str(e))
                     return enhanced_error.to_dict()
             
             else:
