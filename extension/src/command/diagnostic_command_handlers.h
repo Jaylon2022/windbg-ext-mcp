@@ -47,6 +47,13 @@ public:
     // are now handled by enhanced_command_handlers.h to avoid conflicts
     
     /**
+     * @brief Break into a running debug target (equivalent to Ctrl+Break in WinDbg).
+     * @param message JSON message (no parameters required).
+     * @return JSON response indicating whether the interrupt was sent successfully.
+     */
+    static json BreakIntoTargetHandler(const json& message);
+    
+    /**
      * @brief Collect performance metrics.
      * @param message JSON message (no parameters required).
      * @return JSON response with performance data and statistics.

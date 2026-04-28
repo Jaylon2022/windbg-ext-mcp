@@ -12,7 +12,7 @@ from core.validation import validate_command, is_safe_for_automation
 from core.context import get_context_manager, save_context, restore_context
 from core.error_handler import enhance_error, error_enhancer, DebugContext, ErrorCategory
 from core.hints import get_parameter_help, validate_tool_parameters
-from core.communication import send_command, CommunicationError, TimeoutError, ConnectionError
+from core.communication import send_command, send_handler_command, CommunicationError, TimeoutError, ConnectionError
 from core.execution import get_executor, execute_command as execute_unified
 
 from .tool_utilities import (
@@ -517,3 +517,41 @@ def register_execution_tools(mcp: FastMCP):
             error_dict["partial_results"] = results
             error_dict["breakpoint"] = breakpoint
             return error_dict 
+
+    @mcp.tool()
+    async def break_into_target(ctx: Context) -> Dict[str, Any]:
+        """
+        Break into (interrupt) a running debug target — equivalent to pressing Ctrl+Break
+        in WinDbg. Sends DEBUG_INTERRUPT_ACTIVE to the debug engine, which will halt the
+        target at the next available opportunity and return control to the debugger.
+
+        Use this when the target is running (after 'g') and you want to stop it for
+        inspection without setting a breakpoint first.
+
+        Args:
+            ctx: The MCP context
+
+        Returns:
+            Status indicating whether the interrupt was delivered successfully.
+        """
+        logger.debug("Sending break-into-target interrupt")
+        try:
+            result = send_handler_command("break_into_target", timeout_ms=5000)
+            output = result.get("output", "")
+            return {
+                "success": True,
+                "message": output or "Break interrupt sent to target.",
+                "note": "WinDbg will halt the target at the next available opportunity. "
+                        "Use 'k' to inspect the call stack once stopped."
+            }
+        except Exception as e:
+            logger.error(f"break_into_target failed: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "suggestions": [
+                    "Ensure the WinDbg extension is loaded (.load windbgmcpExt.dll)",
+                    "Verify the target is actually running (not already broken in)",
+                    "Check the debug session is still connected"
+                ]
+            }

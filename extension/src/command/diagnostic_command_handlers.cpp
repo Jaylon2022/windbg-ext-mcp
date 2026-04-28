@@ -7,6 +7,7 @@ void DiagnosticCommandHandlers::RegisterHandlers(MCPServer& server) {
     // Register diagnostic command handlers
     server.RegisterHandler("health_check", HealthCheckHandler);
     server.RegisterHandler("performance_metrics", PerformanceMetricsHandler);
+    server.RegisterHandler("break_into_target", BreakIntoTargetHandler);
 }
 
 json DiagnosticCommandHandlers::HealthCheckHandler(const json& message) {
@@ -66,6 +67,50 @@ json DiagnosticCommandHandlers::HealthCheckHandler(const json& message) {
 
 // Removed duplicate handlers - connection_status and capture_session_state
 // are now handled by enhanced_command_handlers.cpp to avoid conflicts
+
+json DiagnosticCommandHandlers::BreakIntoTargetHandler(const json& message) {
+    int id = message.value("id", 0);
+    try {
+        // Create a fresh IDebugClient to reach the current WinDbg session.
+        // Intentionally NOT holding g_dbgengMutex here: SetInterrupt() is
+        // designed to be called from a different thread while Execute() is in
+        // progress; acquiring the execution mutex before SetInterrupt would
+        // deadlock if a command is already running.
+        CComPtr<IDebugClient> client;
+        HRESULT hr = DebugCreate(__uuidof(IDebugClient), (void**)&client);
+        if (FAILED(hr)) {
+            std::ostringstream oss;
+            oss << "DebugCreate failed: 0x" << std::hex << hr;
+            return CommandUtilities::CreateErrorResponse(id, "break_into_target", oss.str());
+        }
+
+        CComQIPtr<IDebugControl> control(client);
+        if (!control) {
+            return CommandUtilities::CreateErrorResponse(id, "break_into_target",
+                "Failed to obtain IDebugControl interface");
+        }
+
+        hr = control->SetInterrupt(DEBUG_INTERRUPT_ACTIVE);
+        if (FAILED(hr)) {
+            std::ostringstream oss;
+            oss << "SetInterrupt failed: 0x" << std::hex << hr
+                << ". The target may not be running or the session may be detached.";
+            return CommandUtilities::CreateErrorResponse(id, "break_into_target", oss.str());
+        }
+
+        return CommandUtilities::CreateSuccessResponse(
+            id, "break_into_target",
+            "Break interrupt sent to target. "
+            "WinDbg will halt execution at the next available opportunity."
+        );
+    }
+    catch (const std::exception& e) {
+        return CommandUtilities::CreateErrorResponse(
+            id, "break_into_target",
+            std::string("Exception during break_into_target: ") + e.what()
+        );
+    }
+}
 
 json DiagnosticCommandHandlers::PerformanceMetricsHandler(const json& message) {
     try {
