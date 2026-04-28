@@ -136,13 +136,13 @@ QUICK_COMMANDS = {"version", "help", "?", "r"}
 # NOTE: "lm" is deliberately NOT in QUICK_COMMANDS – module listing can be slow
 # in kernel sessions with many drivers and belongs in BULK_COMMANDS.
 NORMAL_COMMANDS = {"k", "dv", "dt"}
-ANALYSIS_COMMANDS = {"!analyze", "!thread", "!process"}
+ANALYSIS_COMMANDS = {"!analyze", "!thread", "!process", "!running", "!locks", "!dpcs", "!irql"}
 MEMORY_COMMANDS = {"dd", "dq", "dp", "da", "du"}
 EXECUTION_COMMANDS = {"g", "p", "t", "bp", "bc"}
 
 # Large operation commands that need extended timeouts
 BULK_COMMANDS = {"lm", "!dlls", "!handle", "!vm", "!address"}
-LARGE_ANALYSIS_COMMANDS = {"!analyze -v", "!thread -1", "!process -1", "!process -1 6"}
+LARGE_ANALYSIS_COMMANDS = {"!analyze -v", "!thread -1", "!process -1", "!process -1 6", "!stacks", "!analyze -v -hang"}
 PROCESS_LIST_COMMANDS = {"!process 0 0", "!process 0 7", "!process 0 1f", "!process 0 4"}
 STREAMING_COMMANDS = {"!for_each_process", "!for_each_thread", "!for_each_module"}
 

@@ -403,23 +403,40 @@ def register_analysis_tools(mcp: FastMCP):
             elif action == "all_stacks":
                 try:
                     if is_kernel:
-                        # !process -1 6 gives threads; iterate via !stacks or dump manually
-                        proc_info = send_command("!process -1 6", timeout_ms=_get_timeout("!process -1 6"))
-                        thread_addrs = re.findall(r'THREAD\s+([0-9a-fA-F`]+)', proc_info)
-                        stacks = []
-                        for taddr in thread_addrs[:min(len(thread_addrs), 8)]:
-                            try:
-                                send_command(f".thread {taddr}", timeout_ms=_get_timeout(".thread"))
-                                stack = send_command(f"k {min(count, 15)}", timeout_ms=_get_timeout("k"))
-                                stacks.append({"thread": taddr, "stack": stack})
-                            except Exception:
-                                stacks.append({"thread": taddr, "stack": "(failed to get stack)"})
-                        return {
-                            "thread_count": len(thread_addrs),
-                            "stacks_shown": len(stacks),
-                            "stacks": stacks,
-                            "note": "Only first 8 threads shown. Use action='stack' with a specific address for others."
-                        }
+                        if process_address:
+                            # Process-scoped: get threads of a specific process then dump each stack.
+                            proc_info = send_command(f"!process {process_address} 4", timeout_ms=_get_timeout(f"!process {process_address} 4"))
+                            thread_addrs = re.findall(r'THREAD\s+([0-9a-fA-F`]+)', proc_info)
+                            # Switch VA space so user-mode symbols resolve.
+                            proc_cmd = f".process /r /p {process_address}"
+                            send_command(proc_cmd, timeout_ms=_get_timeout(proc_cmd))
+                            stacks = []
+                            for taddr in thread_addrs:
+                                try:
+                                    send_command(f".thread {taddr}", timeout_ms=_get_timeout(".thread"))
+                                    stack = send_command(f"k {min(count, 20)}", timeout_ms=_get_timeout("k"))
+                                    stacks.append({"thread": taddr, "stack": stack})
+                                except Exception:
+                                    stacks.append({"thread": taddr, "stack": "(failed to get stack)"})
+                            return {
+                                "process_address": process_address,
+                                "thread_count": len(thread_addrs),
+                                "stacks_shown": len(stacks),
+                                "stacks": stacks,
+                                "tip": "For system-wide hang analysis use analyze_kernel(action='stacks')"
+                            }
+                        else:
+                            # System-wide: !stacks 2 covers ALL kernel threads across every process.
+                            # This is the correct command for diagnosing system-level hangs/freezes.
+                            result = send_command("!stacks 2", timeout_ms=_get_timeout("!stacks"))
+                            return {
+                                "output": result,
+                                "note": (
+                                    "System-wide kernel thread stacks via !stacks 2. "
+                                    "To scope to a single process supply process_address='<EPROCESS>'."
+                                ),
+                                "tip": "Use analyze_kernel(action='running') for per-CPU running threads"
+                            }
                     else:
                         # User mode: ~*k
                         result = send_command(f"~*k {count}", timeout_ms=_get_timeout(f"~*k {count}"))
@@ -566,20 +583,149 @@ def register_analysis_tools(mcp: FastMCP):
     @mcp.tool()
     async def analyze_kernel(ctx: Context, action: str, address: str = "") -> Union[str, Dict[str, Any]]:
         """
-        Analyze kernel objects and structures.
-        
+        Analyze kernel objects, structures, and system-wide state.
+
+        **System hang / freeze diagnosis workflow (kernel dual-machine debugging):**
+
+          Step 1 — Break into the target:  break_into_target()
+          Step 2 — Auto analysis:          analyze_kernel(action='analyze')
+          Step 3 — Per-CPU running state:  analyze_kernel(action='running')
+          Step 4 — All kernel stacks:      analyze_kernel(action='stacks')
+          Step 5 — Lock contention:        analyze_kernel(action='locks')
+          Step 6 — DPC queue:              analyze_kernel(action='dpcs')
+          Step 7 — Identify the module:    analyze_kernel(action='modules')
+
         Args:
             ctx: The MCP context
-            action: Action to perform - "object", "idt", "handles", "interrupts", "modules"
-            address: Object address (required for "object", "interrupts")
-            
+            action: Action to perform:
+                    "analyze"    - automatic hang/crash analysis (!analyze -v -hang)
+                    "running"    - threads running on each CPU with stacks (!running -t)
+                    "stacks"     - all non-idle kernel thread stacks system-wide (!stacks 2)
+                    "locks"      - executive resource / mutex lock contention (!locks)
+                    "dpcs"       - deferred procedure call queue (!dpcs)
+                    "object"     - inspect a kernel object (!object <addr>)
+                    "idt"        - Interrupt Descriptor Table (!idt)
+                    "handles"    - system handles (!handle)
+                    "interrupts" - current IRQL or PIC state (!irql / !pic)
+                    "modules"    - loaded kernel modules (lm)
+            address: Object address (required for "object" and "interrupts" with PIC)
+
         Returns:
             Kernel analysis results
         """
         logger.debug(f"Analyze kernel action: {action}, address: {address}")
         
         try:
-            if action == "object":
+            if action == "analyze":
+                # Automatic hang/crash analysis — most important first step for any freeze.
+                # -hang tells WinDbg to focus on hang analysis rather than exception analysis.
+                try:
+                    result = send_command("!analyze -v -hang", timeout_ms=_get_timeout("!analyze -v"))
+                    return {
+                        "output": result,
+                        "context": "Automatic hang/crash analysis",
+                        "next_steps": [
+                            "Review the 'BLOCKING_THREAD' and 'STACK_TEXT' sections",
+                            "Identify the module listed in 'MODULE_NAME' and 'IMAGE_NAME'",
+                            "Run analyze_kernel(action='running') to see per-CPU state",
+                            "Run analyze_kernel(action='stacks') for all thread stacks"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command="!analyze -v -hang", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "running":
+                # !running -t shows what each processor is executing RIGHT NOW.
+                # This is the fastest way to see which CPUs are stuck and on what driver.
+                try:
+                    result = send_command("!running -t", timeout_ms=_get_timeout("!running"))
+                    return {
+                        "output": result,
+                        "context": "Threads currently running on each CPU",
+                        "note": (
+                            "Each block shows one CPU. Look for CPUs stuck in the same "
+                            "driver function repeatedly — that driver is likely the culprit."
+                        ),
+                        "next_steps": [
+                            "If a CPU is in a spin loop in driver X -> X is likely hanging the system",
+                            "Run analyze_kernel(action='stacks') for all waiting threads",
+                            "Run analyze_kernel(action='locks') to find lock contention"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command="!running -t", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "stacks":
+                # !stacks 2 dumps kernel stacks for ALL threads system-wide (skips idle).
+                # This is the definitive command for finding what all threads are doing.
+                try:
+                    result = send_command("!stacks 2", timeout_ms=_get_timeout("!stacks"))
+                    return {
+                        "output": result,
+                        "context": "All non-idle kernel thread stacks (system-wide)",
+                        "note": (
+                            "!stacks 2 filters out common idle frames and groups similar stacks. "
+                            "Look for large groups of threads all waiting on the same function — "
+                            "that function's owning module is a strong hang candidate."
+                        ),
+                        "next_steps": [
+                            "Identify modules appearing at the top of many stuck stacks",
+                            "Use analyze_kernel(action='locks') to check specific lock holders",
+                            "Use analyze_thread(action='info', address='<ETHREAD>') for details"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command="!stacks 2", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "locks":
+                # !locks shows all held ERESOURCE executive locks and their owner threads.
+                # Critical for diagnosing deadlocks and resource starvation hangs.
+                try:
+                    result = send_command("!locks", timeout_ms=_get_timeout("!locks"))
+                    return {
+                        "output": result,
+                        "context": "Kernel executive resource (ERESOURCE) lock state",
+                        "note": (
+                            "Look for resources with ExclusiveOwner or many SharedOwners. "
+                            "The owning thread's call stack will identify the responsible module."
+                        ),
+                        "next_steps": [
+                            "Note the 'ExclusiveOwner' thread address",
+                            "Run analyze_thread(action='stack', address='<owner ETHREAD>') "
+                            "to see what that thread is doing",
+                            "Run analyze_kernel(action='dpcs') if the owner is a DPC routine"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command="!locks", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "dpcs":
+                # !dpcs shows the deferred procedure call queue for each CPU.
+                # A long-running or starved DPC can freeze the whole system.
+                try:
+                    result = send_command("!dpcs", timeout_ms=_get_timeout("!dpcs"))
+                    return {
+                        "output": result,
+                        "context": "Deferred Procedure Call (DPC) queue state",
+                        "note": (
+                            "A DPC that never completes will prevent the CPU from returning "
+                            "to normal thread scheduling. The DPC routine shown is the suspect."
+                        ),
+                        "next_steps": [
+                            "Identify the DPC routine and its owning driver",
+                            "Use 'lm a <DPC_addr>' to find the module",
+                            "Run analyze_kernel(action='running') to see if CPUs are spinning in this DPC"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command="!dpcs", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "object":
                 if not address:
                     enhanced_error = enhance_error("parameter", tool_name="analyze_kernel", missing_param="address")
                     return enhanced_error.to_dict()
@@ -634,8 +780,23 @@ def register_analysis_tools(mcp: FastMCP):
             else:
                 return {
                     "error": f"Unknown action: {action}",
-                    "available_actions": ["object", "idt", "handles", "interrupts", "modules"],
+                    "available_actions": [
+                        "analyze", "running", "stacks", "locks", "dpcs",
+                        "object", "idt", "handles", "interrupts", "modules"
+                    ],
+                    "hang_diagnosis_workflow": [
+                        "1. analyze_kernel(action='analyze')   — !analyze -v -hang",
+                        "2. analyze_kernel(action='running')   — !running -t (per-CPU state)",
+                        "3. analyze_kernel(action='stacks')    — !stacks 2 (all thread stacks)",
+                        "4. analyze_kernel(action='locks')     — !locks (lock contention)",
+                        "5. analyze_kernel(action='dpcs')      — !dpcs (DPC queue)",
+                        "6. analyze_kernel(action='modules')   — lm (identify driver by address)"
+                    ],
                     "examples": [
+                        "analyze_kernel(action='analyze')",
+                        "analyze_kernel(action='running')",
+                        "analyze_kernel(action='stacks')",
+                        "analyze_kernel(action='locks')",
                         "analyze_kernel(action='idt')",
                         "analyze_kernel(action='object', address='0xffffffff80000000')"
                     ]
