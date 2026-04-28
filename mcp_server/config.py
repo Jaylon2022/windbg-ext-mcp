@@ -142,8 +142,8 @@ EXECUTION_COMMANDS = {"g", "p", "t", "bp", "bc"}
 
 # Large operation commands that need extended timeouts
 BULK_COMMANDS = {"lm", "!dlls", "!handle", "!vm", "!address"}
-LARGE_ANALYSIS_COMMANDS = {"!analyze -v", "!thread -1", "!process -1"}
-PROCESS_LIST_COMMANDS = {"!process 0 0", "!process 0 7", "!process 0 1f"}
+LARGE_ANALYSIS_COMMANDS = {"!analyze -v", "!thread -1", "!process -1", "!process -1 6"}
+PROCESS_LIST_COMMANDS = {"!process 0 0", "!process 0 7", "!process 0 1f", "!process 0 4"}
 STREAMING_COMMANDS = {"!for_each_process", "!for_each_thread", "!for_each_module"}
 
 # Symbol operations that need extended timeouts

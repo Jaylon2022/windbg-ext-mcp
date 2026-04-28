@@ -31,13 +31,29 @@ def register_analysis_tools(mcp: FastMCP):
     async def analyze_process(ctx: Context, action: str, address: str = "", save_context: bool = True) -> Union[str, Dict[str, Any]]:
         """
         Analyze processes in the debugging session.
-        
+
+        In kernel-mode debugging, the normal workflow to inspect a user-space process
+        (e.g. dwm.exe) is:
+          1. action='list'   - run !process 0 0 to find the target EPROCESS address
+          2. action='switch' - switch virtual address space with .process /r /p <addr>
+                               (non-invasive; no need to continue the target)
+          3. action='threads'- list all ETHREAD objects for the process (!process <addr> 4)
+          4. Use analyze_thread(action='stack', address=<ETHREAD addr>) for each thread
+          5. action='restore'- return to original kernel context
+
         Args:
             ctx: The MCP context
-            action: Action to perform - "list", "switch", "info", "peb", "restore"
-            address: Process address (required for "switch", "info", "peb")
+            action: Action to perform:
+                    "list"    - enumerate all processes (!process 0 0)
+                    "switch"  - switch process context (.process /r /p in kernel,
+                                .process /i in user/invasive mode when needed)
+                    "threads" - list threads of a process (!process <addr> 4)
+                    "info"    - detailed process dump (!process <addr> 7)
+                    "peb"     - user-mode PEB (user-mode only)
+                    "restore" - restore previously saved context
+            address: Process EPROCESS address (required for switch/threads/info/peb)
             save_context: Whether to save current context before switching (default: True)
-            
+
         Returns:
             Process analysis results
         """
@@ -49,10 +65,11 @@ def register_analysis_tools(mcp: FastMCP):
             params["address"] = address
         if save_context is not True:  # Only include if not default
             params["save_context"] = save_context
-            
+
+        _valid_actions = ["list", "switch", "threads", "info", "peb", "restore"]
         is_valid, validation_errors = validate_tool_parameters("analyze_process", action, params)
         if not is_valid:
-            if action not in ["list", "switch", "info", "peb", "restore"]:
+            if action not in _valid_actions:
                 # Invalid action
                 help_info = get_parameter_help("analyze_process")
                 enhanced_error = enhance_error("parameter", 
@@ -105,27 +122,72 @@ def register_analysis_tools(mcp: FastMCP):
                 if save_context:
                     saved = context_mgr.push_context(send_command)
                     logger.debug(f"Saved context before process switch")
-                
+
+                is_kernel = detect_kernel_mode()
                 try:
-                    # Switch to the specified process
-                    switch_cmd = f".process /i {address}"
-                    result = send_command(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
-                    
-                    return {
-                        "success": True,
-                        "output": result,
-                        "switched_to": address,
-                        "next_steps": [
-                            "Context switch initiated",
-                            "Use 'g' command to let target execute", 
-                            "After break, context will be in the target process"
-                        ]
-                    }
-                    
+                    if is_kernel:
+                        # Non-invasive virtual address space switch — works immediately
+                        # without needing to continue/break the target again.
+                        # /r reloads user-mode symbols for the new process.
+                        # /p sets the implicit process (affects dt, !peb, etc.).
+                        switch_cmd = f".process /r /p {address}"
+                        result = send_command(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
+                        return {
+                            "success": True,
+                            "output": result,
+                            "switched_to": address,
+                            "mode": "kernel_non_invasive",
+                            "next_steps": [
+                                "Context switched — you can now inspect this process's virtual memory",
+                                "Use analyze_process(action='threads', address=...) to list its threads",
+                                "Use analyze_thread(action='stack', address=<ETHREAD>) to see a thread's stack",
+                                "Use analyze_process(action='restore') when done"
+                            ]
+                        }
+                    else:
+                        # Invasive switch for user-mode debugging
+                        switch_cmd = f".process /i {address}"
+                        result = send_command(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
+                        return {
+                            "success": True,
+                            "output": result,
+                            "switched_to": address,
+                            "mode": "user_invasive",
+                            "next_steps": [
+                                "Run 'g' to let the target reach a breakpoint in this process context",
+                                "After breaking, inspect threads, memory, etc."
+                            ]
+                        }
                 except Exception as e:
                     enhanced_error = enhance_error("execution", command=switch_cmd, original_error=str(e))
                     return enhanced_error.to_dict()
                     
+            elif action == "threads":
+                # List all threads belonging to a specific process.
+                # This uses !process <addr> 4 which outputs ETHREAD addresses — the
+                # correct input for analyze_thread(action='switch'/'stack') in kernel mode.
+                if not address:
+                    enhanced_error = enhance_error("parameter", tool_name="analyze_process", missing_param="address")
+                    return enhanced_error.to_dict()
+                try:
+                    result = send_command(f"!process {address} 4", timeout_ms=_get_timeout(f"!process {address} 4"))
+                    # Parse out ETHREAD addresses to guide the AI
+                    thread_addrs = re.findall(r'THREAD\s+([0-9a-fA-F`]+)', result)
+                    return {
+                        "output": result,
+                        "process_address": address,
+                        "thread_addresses": thread_addrs,
+                        "thread_count": len(thread_addrs),
+                        "next_steps": [
+                            f"To see a thread's call stack: analyze_thread(action='stack', address='<ETHREAD addr>')",
+                            f"To see thread details: analyze_thread(action='info', address='<ETHREAD addr>')",
+                            "ETHREAD addresses are listed in thread_addresses above"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command=f"!process {address} 4", original_error=str(e))
+                    return enhanced_error.to_dict()
+
             elif action == "info":
                 if not address:
                     enhanced_error = enhance_error("parameter", tool_name="analyze_process", missing_param="address")
@@ -196,140 +258,205 @@ def register_analysis_tools(mcp: FastMCP):
             else:
                 return {
                     "error": f"Unknown action: {action}",
-                    "available_actions": ["list", "switch", "info", "peb", "restore"],
+                    "available_actions": ["list", "switch", "threads", "info", "peb", "restore"],
+                    "kernel_workflow": [
+                        "1. analyze_process(action='list') — find EPROCESS address of target",
+                        "2. analyze_process(action='switch', address='<EPROCESS>') — switch VA space",
+                        "3. analyze_process(action='threads', address='<EPROCESS>') — list ETHREAD addrs",
+                        "4. analyze_thread(action='stack', address='<ETHREAD>') — get call stack",
+                        "5. analyze_process(action='restore') — return to kernel context"
+                    ],
                     "examples": [
                         "analyze_process(action='list')",
+                        "analyze_process(action='switch', address='0xffff8e0e481d7080')",
+                        "analyze_process(action='threads', address='0xffff8e0e481d7080')",
                         "analyze_process(action='info', address='0xffff8e0e481d7080')"
                     ]
                 }
-                
+
         except Exception as e:
             enhanced_error = enhance_error("unexpected", tool_name="analyze_process", original_error=str(e))
             return enhanced_error.to_dict()
 
     @mcp.tool()
-    async def analyze_thread(ctx: Context, action: str, address: str = "", count: int = 20) -> Union[str, Dict[str, Any]]:
+    async def analyze_thread(ctx: Context, action: str, address: str = "", count: int = 20, process_address: str = "") -> Union[str, Dict[str, Any]]:
         """
         Analyze threads in the debugging session.
-        
+
+        In kernel-mode debugging:
+          - 'address' is an ETHREAD pointer (obtained from analyze_process threads action
+            or from !process <eprocess> 4 output).
+          - Use action='switch' to set the implicit thread (.thread <ETHREAD>).
+          - Use action='stack' to dump the kernel call stack of a specific thread
+            (optionally supply process_address to first switch the VA space so user-mode
+            frames are also resolved correctly).
+
         Args:
             ctx: The MCP context
-            action: Action to perform - "list", "switch", "info", "stack", "all_stacks", "teb"
-            address: Thread address (required for "switch", "info", "stack", "teb")
-            count: Number of stack frames or threads to show (default: 20)
-            
+            action: Action to perform:
+                    "list"       - list threads (kernel: !process -1 6; user: ~*)
+                    "switch"     - switch to thread context (kernel: .thread; user: ~ns)
+                    "info"       - detailed thread dump (!thread <addr>)
+                    "stack"      - call stack of a thread (kP or k)
+                    "all_stacks" - stacks of all threads in current process
+                    "teb"        - Thread Environment Block (user-mode only)
+            address: ETHREAD address (kernel) or thread index (user)
+            count: Number of stack frames to display (default: 20)
+            process_address: (kernel only) EPROCESS of the owning process — when provided,
+                             the VA space is switched first so user-mode symbols resolve
+        
         Returns:
             Thread analysis results
         """
         logger.debug(f"Analyze thread action: {action}, address: {address}")
         
+        is_kernel = detect_kernel_mode()
+
         try:
             context_mgr = get_context_manager()
-            
+
             if action == "list":
-                # List all threads
                 try:
-                    result = send_command("!thread", timeout_ms=_get_timeout("!thread"))
-                    return {"output": result, "note": "Copy thread address for detailed analysis"}
+                    if is_kernel:
+                        # !process -1 6  → threads of current implicit process with basic info
+                        result = send_command("!process -1 6", timeout_ms=_get_timeout("!process -1 6"))
+                        thread_addrs = re.findall(r'THREAD\s+([0-9a-fA-F`]+)', result)
+                        return {
+                            "output": result,
+                            "thread_addresses": thread_addrs,
+                            "thread_count": len(thread_addrs),
+                            "note": "Use the ETHREAD addresses above with action='stack' or action='info'"
+                        }
+                    else:
+                        result = send_command("~*", timeout_ms=_get_timeout("~*"))
+                        return {"output": result, "note": "Copy thread index for detailed analysis"}
                 except Exception as e:
-                    enhanced_error = enhance_error("execution", command="!thread", original_error=str(e))
+                    enhanced_error = enhance_error("execution", command="!process -1 6" if is_kernel else "~*", original_error=str(e))
                     return enhanced_error.to_dict()
-                    
+
             elif action == "switch":
                 if not address:
                     enhanced_error = enhance_error("parameter", tool_name="analyze_thread", missing_param="address")
                     return enhanced_error.to_dict()
-                
+
                 try:
-                    switch_cmd = f"~{address}s"
+                    if is_kernel:
+                        # address is an ETHREAD pointer
+                        switch_cmd = f".thread {address}"
+                    else:
+                        # address is a thread index
+                        switch_cmd = f"~{address}s"
                     result = send_command(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
-                    return {"output": result, "switched_to": address}
+                    return {
+                        "output": result,
+                        "switched_to": address,
+                        "next_steps": ["Run analyze_thread(action='stack') to see the call stack"]
+                    }
                 except Exception as e:
                     enhanced_error = enhance_error("execution", command=switch_cmd, original_error=str(e))
                     return enhanced_error.to_dict()
-                    
+
             elif action == "info":
                 if not address:
                     enhanced_error = enhance_error("parameter", tool_name="analyze_thread", missing_param="address")
                     return enhanced_error.to_dict()
-                
+
                 try:
                     result = send_command(f"!thread {address}", timeout_ms=_get_timeout(f"!thread {address}"))
                     return {"output": result, "thread_address": address}
                 except Exception as e:
                     enhanced_error = enhance_error("execution", command=f"!thread {address}", original_error=str(e))
                     return enhanced_error.to_dict()
-                    
+
             elif action == "stack":
                 try:
-                    if address:
-                        # Switch to thread first, then get stack
-                        switch_cmd = f"~{address}s"
-                        send_command(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
-                    
-                    stack_result = send_command(f"k {count}", timeout_ms=_get_timeout(f"k {count}"))
-                    return {"output": stack_result, "stack_frames": count}
+                    ops = []
+                    if is_kernel:
+                        # Kernel mode: first switch VA space if a process is given,
+                        # then set implicit thread, then dump stack.
+                        if process_address:
+                            proc_cmd = f".process /r /p {process_address}"
+                            send_command(proc_cmd, timeout_ms=_get_timeout(proc_cmd))
+                            ops.append(proc_cmd)
+                        if address:
+                            thread_cmd = f".thread {address}"
+                            send_command(thread_cmd, timeout_ms=_get_timeout(thread_cmd))
+                            ops.append(thread_cmd)
+                        # kP shows parameters; fall back to k if kP is too heavy
+                        stack_result = send_command(f"kP {count}", timeout_ms=_get_timeout(f"kP {count}"))
+                    else:
+                        if address:
+                            switch_cmd = f"~{address}s"
+                            send_command(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
+                            ops.append(switch_cmd)
+                        stack_result = send_command(f"k {count}", timeout_ms=_get_timeout(f"k {count}"))
+                    return {
+                        "output": stack_result,
+                        "thread_address": address,
+                        "stack_frames": count,
+                        "ops_performed": ops
+                    }
                 except Exception as e:
                     enhanced_error = enhance_error("execution", command=f"k {count}", original_error=str(e))
                     return enhanced_error.to_dict()
-                    
+
             elif action == "all_stacks":
                 try:
-                    result = send_command(f"k {count}", timeout_ms=_get_timeout(f"k {count}"))
-                    
-                    # Get basic thread list for context
-                    thread_list = send_command("!thread", timeout_ms=_get_timeout("!thread"))
-                    
-                    # For performance, show limited stacks for multiple threads
-                    stacks = []
-                    try:
-                        # Try to get stacks for a few threads (simplified approach)
-                        for i in range(min(3, count // 10)):  # Sample a few threads
+                    if is_kernel:
+                        # !process -1 6 gives threads; iterate via !stacks or dump manually
+                        proc_info = send_command("!process -1 6", timeout_ms=_get_timeout("!process -1 6"))
+                        thread_addrs = re.findall(r'THREAD\s+([0-9a-fA-F`]+)', proc_info)
+                        stacks = []
+                        for taddr in thread_addrs[:min(len(thread_addrs), 8)]:
                             try:
-                                stack = send_command("k 10", timeout_ms=_get_timeout("k 10"))  # Shorter stacks for multiple threads
-                                stacks.append(f"Thread {i} stack (sample):\n{stack}")
-                            except:
-                                continue
-                    except:
-                        pass
-                    
-                    return {
-                        "output": result,
-                        "thread_list": thread_list[:500] + "..." if len(thread_list) > 500 else thread_list,
-                        "sample_stacks": stacks
-                    }
+                                send_command(f".thread {taddr}", timeout_ms=_get_timeout(".thread"))
+                                stack = send_command(f"k {min(count, 15)}", timeout_ms=_get_timeout("k"))
+                                stacks.append({"thread": taddr, "stack": stack})
+                            except Exception:
+                                stacks.append({"thread": taddr, "stack": "(failed to get stack)"})
+                        return {
+                            "thread_count": len(thread_addrs),
+                            "stacks_shown": len(stacks),
+                            "stacks": stacks,
+                            "note": "Only first 8 threads shown. Use action='stack' with a specific address for others."
+                        }
+                    else:
+                        # User mode: ~*k
+                        result = send_command(f"~*k {count}", timeout_ms=_get_timeout(f"~*k {count}"))
+                        return {"output": result, "stack_frames": count}
                 except Exception as e:
-                    enhanced_error = enhance_error("execution", command=f"k {count}", original_error=str(e))
+                    enhanced_error = enhance_error("execution", command="all_stacks", original_error=str(e))
                     return enhanced_error.to_dict()
-                    
+
             elif action == "teb":
-                # Get Thread Environment Block information  
-                if detect_kernel_mode():
+                if is_kernel:
                     return {
-                        "error": "TEB analysis not available in kernel mode",
-                        "suggestion": "Use !thread command for kernel-mode thread analysis",
+                        "error": "TEB is a user-mode structure and is not directly accessible in kernel mode",
+                        "suggestion": (
+                            "Switch to the process first with analyze_process(action='switch', address=<EPROCESS>), "
+                            "then use dt nt!_TEB <teb_addr> or !thread <ETHREAD> (look for Teb field)"
+                        ),
                         "category": "mode_mismatch"
                     }
-                
+
                 try:
                     if address:
-                        # Switch to thread first
-                        switch_cmd = f"~{address}s"
-                        send_command(switch_cmd, timeout_ms=_get_timeout(switch_cmd))
-                        
+                        send_command(f"~{address}s", timeout_ms=_get_timeout(f"~{address}s"))
                     teb_result = send_command("!teb", timeout_ms=_get_timeout("!teb"))
                     return {"output": teb_result, "context": "Thread Environment Block"}
                 except Exception as e:
                     enhanced_error = enhance_error("execution", command="!teb", original_error=str(e))
                     return enhanced_error.to_dict()
-                    
+
             else:
                 return {
                     "error": f"Unknown action: {action}",
                     "available_actions": ["list", "switch", "info", "stack", "all_stacks", "teb"],
+                    "kernel_note": "In kernel mode, 'address' is an ETHREAD pointer (from !process <eprocess> 4)",
                     "examples": [
-                        "analyze_thread(action='list')",
-                        "analyze_thread(action='stack', count=20)"
+                        "analyze_thread(action='list')  # kernel: threads of current process",
+                        "analyze_thread(action='stack', address='<ETHREAD>', process_address='<EPROCESS>')",
+                        "analyze_thread(action='all_stacks')  # kernel: stacks of first 8 threads"
                     ]
                 }
                 
