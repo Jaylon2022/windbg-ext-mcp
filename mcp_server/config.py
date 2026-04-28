@@ -136,7 +136,7 @@ QUICK_COMMANDS = {"version", "help", "?", "r"}
 # NOTE: "lm" is deliberately NOT in QUICK_COMMANDS – module listing can be slow
 # in kernel sessions with many drivers and belongs in BULK_COMMANDS.
 NORMAL_COMMANDS = {"k", "dv", "dt"}
-ANALYSIS_COMMANDS = {"!analyze", "!thread", "!process", "!running", "!locks", "!dpcs", "!irql"}
+ANALYSIS_COMMANDS = {"!analyze", "!thread", "!process", "!running", "!locks", "!dpcs", "!irql", ".bugcheck"}
 MEMORY_COMMANDS = {"dd", "dq", "dp", "da", "du"}
 EXECUTION_COMMANDS = {"g", "p", "t", "bp", "bc"}
 

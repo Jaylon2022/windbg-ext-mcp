@@ -66,14 +66,58 @@ def register_support_tools(mcp: FastMCP):
                     return f"Symbol troubleshooting failed: {str(e)}"
                 
             elif action == "exception":
-                # Analyze current exception
-                result = send_command("!analyze -v", timeout_ms=_get_timeout("!analyze -v"))
-                return f"=== EXCEPTION ANALYSIS ===\n{result}"
-            
+                # Full driver crash / bugcheck analysis workflow.
+                # Runs the same sequence as analyze_kernel(action='bugcheck') but is
+                # accessible from the troubleshoot tool for convenience.
+                crash_steps = []
+
+                # 1. Bugcheck code and raw parameters
+                try:
+                    bc_out = send_command(".bugcheck", timeout_ms=_get_timeout(".bugcheck"))
+                    crash_steps.append({"step": "bugcheck_info", "output": bc_out, "success": True})
+                except Exception as e:
+                    crash_steps.append({"step": "bugcheck_info", "error": str(e), "success": False})
+
+                # 2. Full crash analysis (no -hang flag — that is for freezes only)
+                try:
+                    analyze_out = send_command("!analyze -v", timeout_ms=_get_timeout("!analyze -v"))
+                    crash_steps.append({"step": "crash_analysis", "output": analyze_out, "success": True})
+                except Exception as e:
+                    crash_steps.append({"step": "crash_analysis", "error": str(e), "success": False})
+
+                # 3. Call stack of the crashing thread
+                try:
+                    stack_out = send_command("kP 30", timeout_ms=_get_timeout("kP"))
+                    crash_steps.append({"step": "crash_stack", "output": stack_out, "success": True})
+                except Exception as e:
+                    crash_steps.append({"step": "crash_stack", "error": str(e), "success": False})
+
+                return {
+                    "context": "Driver crash / exception analysis",
+                    "steps": crash_steps,
+                    "next_steps": [
+                        "Find 'MODULE_NAME' and 'IMAGE_NAME' in crash_analysis — that is the responsible driver",
+                        "Find 'STACK_TEXT' in crash_analysis to trace the exact failure path",
+                        "Use 'lm a <address>' to identify any unknown address as a module",
+                        "If pool corruption (0xC2/0x19): run run_command('!pool <param2_addr>')",
+                        "If IRQL violation (0xD1/0x0A): driver is accessing paged memory at high IRQL",
+                        "For symbols: troubleshoot(action='symbols') if MODULE_NAME shows '???'"
+                    ]
+                }
+
             elif action == "analyze":
-                # General system analysis
+                # General system analysis — same as exception but kept for backward compat.
+                # Prefer troubleshoot(action='exception') for crash, analyze_kernel(action='analyze')
+                # for hangs.
                 result = send_command("!analyze -v", timeout_ms=_get_timeout("!analyze -v"))
-                return f"=== SYSTEM ANALYSIS ===\n{result}"
+                return {
+                    "context": "General system analysis (!analyze -v)",
+                    "output": result,
+                    "tip": (
+                        "For a full crash workflow use troubleshoot(action='exception'). "
+                        "For hang analysis use analyze_kernel(action='analyze')."
+                    )
+                }
             
             elif action == "connection":
                 # Test connection and provide status

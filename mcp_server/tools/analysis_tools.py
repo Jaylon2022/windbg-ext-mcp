@@ -585,20 +585,29 @@ def register_analysis_tools(mcp: FastMCP):
         """
         Analyze kernel objects, structures, and system-wide state.
 
-        **System hang / freeze diagnosis workflow (kernel dual-machine debugging):**
+        **Driver crash (bugcheck/BSOD) diagnosis workflow:**
 
-          Step 1 — Break into the target:  break_into_target()
-          Step 2 — Auto analysis:          analyze_kernel(action='analyze')
-          Step 3 — Per-CPU running state:  analyze_kernel(action='running')
-          Step 4 — All kernel stacks:      analyze_kernel(action='stacks')
-          Step 5 — Lock contention:        analyze_kernel(action='locks')
-          Step 6 — DPC queue:              analyze_kernel(action='dpcs')
-          Step 7 — Identify the module:    analyze_kernel(action='modules')
+          Step 1 — Auto crash analysis:   analyze_kernel(action='bugcheck')
+          Step 2 — Identify the driver:   analyze_kernel(action='modules') + 'lm a <addr>'
+          Step 3 — If pool corruption:    run_command('!pool <addr>') with the pool address
+          Step 4 — If IRP related:        run_command('!irp <addr>') with the IRP address
+
+        **System hang / freeze diagnosis workflow:**
+
+          Step 1 — Break into target:     break_into_target()
+          Step 2 — Auto hang analysis:    analyze_kernel(action='analyze')
+          Step 3 — Per-CPU running state: analyze_kernel(action='running')
+          Step 4 — All kernel stacks:     analyze_kernel(action='stacks')
+          Step 5 — Lock contention:       analyze_kernel(action='locks')
+          Step 6 — DPC queue:             analyze_kernel(action='dpcs')
 
         Args:
             ctx: The MCP context
             action: Action to perform:
-                    "analyze"    - automatic hang/crash analysis (!analyze -v -hang)
+                    "bugcheck"   - full crash/BSOD analysis: .bugcheck + !analyze -v + call stack
+                                   USE THIS for driver crashes and blue screens
+                    "analyze"    - hang analysis (!analyze -v -hang), for frozen system
+                                   USE THIS when you manually break into a running/frozen system
                     "running"    - threads running on each CPU with stacks (!running -t)
                     "stacks"     - all non-idle kernel thread stacks system-wide (!stacks 2)
                     "locks"      - executive resource / mutex lock contention (!locks)
@@ -616,17 +625,81 @@ def register_analysis_tools(mcp: FastMCP):
         logger.debug(f"Analyze kernel action: {action}, address: {address}")
         
         try:
-            if action == "analyze":
-                # Automatic hang/crash analysis — most important first step for any freeze.
-                # -hang tells WinDbg to focus on hang analysis rather than exception analysis.
+            if action == "bugcheck":
+                # Full driver crash / BSOD analysis workflow.
+                # This is the correct entry point when the target has crashed (blue screen).
+                # Do NOT use -hang here: -hang forces hang-analysis mode and ignores the
+                # actual bugcheck exception, giving wrong results for crash analysis.
+                crash_results = []
+
+                # Step 1: Get raw bugcheck code and parameters.
+                try:
+                    bc_out = send_command(".bugcheck", timeout_ms=_get_timeout(".bugcheck"))
+                    crash_results.append({"step": "bugcheck_info", "output": bc_out})
+                except Exception as e:
+                    crash_results.append({"step": "bugcheck_info", "error": str(e)})
+
+                # Step 2: Full automatic crash analysis — WinDbg reads the exception record
+                # and maps it to the responsible driver automatically.
+                try:
+                    analyze_out = send_command("!analyze -v", timeout_ms=_get_timeout("!analyze -v"))
+                    crash_results.append({"step": "crash_analysis", "output": analyze_out})
+                except Exception as e:
+                    crash_results.append({"step": "crash_analysis", "error": str(e)})
+
+                # Step 3: Call stack of the crashing thread (with parameters).
+                try:
+                    stack_out = send_command("kP 30", timeout_ms=_get_timeout("kP"))
+                    crash_results.append({"step": "crash_stack", "output": stack_out})
+                except Exception as e:
+                    crash_results.append({"step": "crash_stack", "error": str(e)})
+
+                return {
+                    "success": True,
+                    "context": "Driver crash / bugcheck analysis",
+                    "steps": crash_results,
+                    "next_steps": [
+                        "Find 'MODULE_NAME' and 'IMAGE_NAME' in crash_analysis output — that is the responsible driver",
+                        "Find 'STACK_TEXT' in crash_analysis to trace the exact failure path",
+                        "Use 'lm a <address>' to identify any unknown address as a module",
+                        "If bugcheck is 0xC2 (BAD_POOL_CALLER) or 0x19 (BAD_POOL_HEADER): "
+                        "run run_command('!pool <addr>') with the pool address from .bugcheck params",
+                        "If bugcheck is 0xD1 (DRIVER_IRQL_NOT_LESS_OR_EQUAL): the driver is "
+                        "accessing paged memory at elevated IRQL — see STACK_TEXT for the driver",
+                        "If bugcheck is 0x7E or 0x8E (unexpected kernel exception): check "
+                        "EXCEPTION_CODE and the faulting instruction in STACK_TEXT",
+                        "Use analyze_kernel(action='modules') then 'lm a <addr>' to confirm the driver"
+                    ],
+                    "common_bugchecks": {
+                        "0x0000000A (IRQL_NOT_LESS_OR_EQUAL)": "Driver accessing paged memory at elevated IRQL",
+                        "0x0000001E (KMODE_EXCEPTION_NOT_HANDLED)": "Unhandled kernel exception, check STOP parameters",
+                        "0x00000019 (BAD_POOL_HEADER)": "Pool corruption — run !pool with param2",
+                        "0x000000C2 (BAD_POOL_CALLER)": "Invalid pool allocation — run !pool with param2",
+                        "0x000000D1 (DRIVER_IRQL_NOT_LESS_OR_EQUAL)": "Driver IRQL violation",
+                        "0x000000FC (ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY)": "DEP violation in driver",
+                        "0x00000050 (PAGE_FAULT_IN_NONPAGED_AREA)": "Invalid memory access in driver",
+                        "0x0000007E (SYSTEM_THREAD_EXCEPTION_NOT_HANDLED)": "System thread exception",
+                        "0x00000133 (DPC_WATCHDOG_VIOLATION)": "DPC ran too long — check !dpcs"
+                    }
+                }
+
+            elif action == "analyze":
+                # Hang analysis — use ONLY when the system is frozen/unresponsive and you
+                # manually broke in (Ctrl+Break / break_into_target). The -hang flag forces
+                # WinDbg into hang-analysis mode even without an active exception.
+                # WARNING: Do NOT use this for crash/BSOD analysis — use action='bugcheck' instead.
                 try:
                     result = send_command("!analyze -v -hang", timeout_ms=_get_timeout("!analyze -v"))
                     return {
                         "output": result,
-                        "context": "Automatic hang/crash analysis",
+                        "context": "Hang analysis (manually broken-in system)",
+                        "note": (
+                            "This uses !analyze -v -hang which is designed for frozen systems. "
+                            "If the system CRASHED (BSOD), use analyze_kernel(action='bugcheck') instead."
+                        ),
                         "next_steps": [
-                            "Review the 'BLOCKING_THREAD' and 'STACK_TEXT' sections",
-                            "Identify the module listed in 'MODULE_NAME' and 'IMAGE_NAME'",
+                            "Review 'BLOCKING_THREAD' and 'STACK_TEXT' sections",
+                            "Identify the module in 'MODULE_NAME' and 'IMAGE_NAME'",
                             "Run analyze_kernel(action='running') to see per-CPU state",
                             "Run analyze_kernel(action='stacks') for all thread stacks"
                         ]
@@ -781,19 +854,26 @@ def register_analysis_tools(mcp: FastMCP):
                 return {
                     "error": f"Unknown action: {action}",
                     "available_actions": [
-                        "analyze", "running", "stacks", "locks", "dpcs",
+                        "bugcheck", "analyze", "running", "stacks", "locks", "dpcs",
                         "object", "idt", "handles", "interrupts", "modules"
                     ],
+                    "crash_diagnosis_workflow": [
+                        "1. analyze_kernel(action='bugcheck')  — .bugcheck + !analyze -v + kP (FOR BSOD/CRASH)",
+                        "2. analyze_kernel(action='modules')   — lm to identify driver by address",
+                        "3. run_command('!pool <addr>')        — if pool corruption bugcheck",
+                        "4. run_command('!irp <addr>')         — if IRP-related crash"
+                    ],
                     "hang_diagnosis_workflow": [
-                        "1. analyze_kernel(action='analyze')   — !analyze -v -hang",
-                        "2. analyze_kernel(action='running')   — !running -t (per-CPU state)",
-                        "3. analyze_kernel(action='stacks')    — !stacks 2 (all thread stacks)",
-                        "4. analyze_kernel(action='locks')     — !locks (lock contention)",
-                        "5. analyze_kernel(action='dpcs')      — !dpcs (DPC queue)",
-                        "6. analyze_kernel(action='modules')   — lm (identify driver by address)"
+                        "1. break_into_target()                — interrupt running system",
+                        "2. analyze_kernel(action='analyze')   — !analyze -v -hang (FOR HANG/FREEZE)",
+                        "3. analyze_kernel(action='running')   — !running -t (per-CPU state)",
+                        "4. analyze_kernel(action='stacks')    — !stacks 2 (all thread stacks)",
+                        "5. analyze_kernel(action='locks')     — !locks (lock contention)",
+                        "6. analyze_kernel(action='dpcs')      — !dpcs (DPC queue)"
                     ],
                     "examples": [
-                        "analyze_kernel(action='analyze')",
+                        "analyze_kernel(action='bugcheck')   # driver crash / BSOD",
+                        "analyze_kernel(action='analyze')    # system hang / freeze",
                         "analyze_kernel(action='running')",
                         "analyze_kernel(action='stacks')",
                         "analyze_kernel(action='locks')",
