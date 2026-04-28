@@ -327,41 +327,118 @@ def register_execution_tools(mcp: FastMCP):
             return error_dict 
 
     @mcp.tool()
-    async def breakpoint_and_continue(ctx: Context, breakpoint: str, continue_execution: bool = True, clear_existing: bool = False) -> Dict[str, Any]:
+    async def breakpoint_and_continue(ctx: Context, breakpoint: str, continue_execution: bool = True, clear_existing: bool = False, process_address: str = "", use_hardware_bp: bool = False) -> Dict[str, Any]:
         """
         Set a breakpoint and optionally continue execution.
-        
+
+        **Kernel-mode / dual-machine debugging note (dwm.exe etc.):**
+
+        In kernel-mode debugging a simple `bp module!symbol` is a *global* breakpoint —
+        it fires whenever *any* process reaches that code, not just your target process.
+        To break only inside a specific user-space process use one of these strategies:
+
+        Strategy A — invasive process-context switch (recommended for user-mode symbols):
+          1. Call analyze_process(action='list') to find the EPROCESS address.
+          2. Call analyze_process(action='switch', address='<EPROCESS>') — this uses
+             .process /i which requires the target to run and break again.
+          3. THEN call this tool with the symbol/address.
+          The breakpoint will be set inside the process's VA space.
+
+        Strategy B — hardware breakpoint (use_hardware_bp=True):
+          Hardware breakpoints (ba) are not VA-space-dependent and fire regardless of
+          the process context. Useful for address-based breakpoints. They still fire for
+          all processes unless a condition filter is added manually.
+
+        Strategy C — supply process_address here:
+          When process_address is provided this tool automatically performs the invasive
+          switch (.process /i), sets the breakpoint, and gives correct next-step guidance.
+          You still need to run 'g' to reach the process context before the bp is active.
+
         Args:
             ctx: The MCP context
-            breakpoint: Breakpoint specification (e.g., "nt!NtCreateFile", "0x12345678", "kernel32!CreateFileW")
-            continue_execution: Whether to continue execution after setting breakpoint (default: True)
+            breakpoint: Breakpoint specification (e.g., "dwm!CDesktopManager::UpdateVisuals",
+                        "0x12345678", "win32kbase!NtUserGetMessage")
+            continue_execution: Whether to issue 'g' after setting breakpoint (default: True)
             clear_existing: Whether to clear existing breakpoints first (default: False)
-            
+            process_address: (kernel mode) EPROCESS address of the target process.
+                             When set, performs .process /i before setting the breakpoint.
+            use_hardware_bp: Use 'ba e1' (hardware execution breakpoint) instead of 'bp'.
+                             Useful when the VA space is not accessible. (default: False)
+
         Returns:
             Results of breakpoint setting and execution control with debugging guidance
         """
-        logger.debug(f"Setting breakpoint: {breakpoint}, continue: {continue_execution}, clear_existing: {clear_existing}")
-        
+        logger.debug(f"Setting breakpoint: {breakpoint}, continue: {continue_execution}, "
+                     f"clear_existing: {clear_existing}, process_address: {process_address}, "
+                     f"use_hardware_bp: {use_hardware_bp}")
+
         # Validate parameters
         if not breakpoint or not breakpoint.strip():
             enhanced_error = enhance_error("parameter", 
                                          tool_name="breakpoint_and_continue", 
                                          missing_param="breakpoint")
             return enhanced_error.to_dict()
-        
+
+        is_kernel = detect_kernel_mode()
+
         # Update context for better error suggestions
-        error_enhancer.update_context(DebugContext.KERNEL_MODE if detect_kernel_mode() else DebugContext.USER_MODE)
-        
+        error_enhancer.update_context(DebugContext.KERNEL_MODE if is_kernel else DebugContext.USER_MODE)
+
         # Save context before breakpoint operations
         context_manager = get_context_manager()
         context_saved = save_context(send_command)
-        
+
         results = []
-        
+
         try:
+            # Step 0: In kernel mode, switch to the target process first if requested
+            if is_kernel and process_address:
+                try:
+                    # Invasive switch: sets up the breakpoint in the correct VA space.
+                    # The breakpoint will become active once the target runs into dwm.exe's
+                    # context; issuing 'g' afterwards is mandatory.
+                    proc_cmd = f".process /i {process_address}"
+                    proc_result = execute_unified(proc_cmd, resilient=False, optimize=False)
+                    results.append({
+                        "step": "switch_to_process",
+                        "command": proc_cmd,
+                        "success": proc_result.success,
+                        "result": proc_result.result if proc_result.success else proc_result.error,
+                        "execution_time": proc_result.execution_time,
+                    })
+                    if not proc_result.success:
+                        return {
+                            "success": False,
+                            "error": f"Failed to switch to process context: {proc_result.error}",
+                            "breakpoint": breakpoint,
+                            "steps_completed": results,
+                            "suggestions": [
+                                "Verify the EPROCESS address with analyze_process(action='list')",
+                                "Ensure the target is currently broken into the debugger"
+                            ]
+                        }
+                    # After .process /i we MUST 'g' once to reach the context boundary.
+                    # We always do this regardless of continue_execution so the breakpoint
+                    # can be set in the correct VA space.
+                    g_result = execute_unified("g", resilient=False, optimize=False)
+                    results.append({
+                        "step": "run_to_process_context",
+                        "command": "g",
+                        "success": g_result.success,
+                        "result": g_result.result if g_result.success else g_result.error,
+                        "execution_time": g_result.execution_time,
+                        "note": "Running until WinDbg breaks into the target process context"
+                    })
+                except Exception as e:
+                    results.append({
+                        "step": "switch_to_process",
+                        "command": f".process /i {process_address}",
+                        "success": False,
+                        "error": str(e)
+                    })
+
             # Step 1: Clear existing breakpoints if requested
             if clear_existing:
-                logger.debug("Clearing existing breakpoints")
                 try:
                     clear_result = execute_unified("bc *", resilient=True, optimize=True)
                     results.append({
@@ -381,11 +458,15 @@ def register_execution_tools(mcp: FastMCP):
                         "success": False,
                         "error": str(e)
                     })
-            
+
             # Step 2: Set the new breakpoint
-            bp_command = f"bp {breakpoint}"
+            if use_hardware_bp:
+                # Hardware execution breakpoint — works without VA space dependency
+                bp_command = f"ba e1 {breakpoint}"
+            else:
+                bp_command = f"bp {breakpoint}"
             logger.debug(f"Setting breakpoint with command: {bp_command}")
-            
+
             bp_result = execute_unified(bp_command, resilient=True, optimize=True)
             results.append({
                 "step": "set_breakpoint",
@@ -396,21 +477,26 @@ def register_execution_tools(mcp: FastMCP):
                 "cached": bp_result.cached,
                 "execution_mode": bp_result.execution_mode.value
             })
-            
+
             if not bp_result.success:
+                suggestions = [
+                    "Check that the symbol/address is valid",
+                    "Ensure symbols are loaded (.reload)",
+                    "Verify the module is loaded (lm)",
+                    "Try a different breakpoint format"
+                ]
+                if is_kernel:
+                    suggestions.insert(0,
+                        "In kernel mode, first switch to the process context with "
+                        "process_address='<EPROCESS>' parameter so user-mode symbols resolve")
                 return {
                     "success": False,
                     "error": f"Failed to set breakpoint: {bp_result.error}",
                     "breakpoint": breakpoint,
                     "steps_completed": results,
-                    "suggestions": [
-                        "Check that the symbol/address is valid",
-                        "Ensure symbols are loaded (.reload)",
-                        "Verify the module is loaded (lm)",
-                        "Try a different breakpoint format"
-                    ]
+                    "suggestions": suggestions
                 }
-            
+
             # Step 3: List breakpoints to confirm
             try:
                 list_result = execute_unified("bl", resilient=True, optimize=True)
@@ -423,17 +509,14 @@ def register_execution_tools(mcp: FastMCP):
                     "execution_mode": list_result.execution_mode.value
                 })
             except Exception as e:
-                results.append({
-                    "step": "list_breakpoints",
-                    "command": "bl",
-                    "success": False,
-                    "error": str(e)
-                })
-            
+                results.append({"step": "list_breakpoints", "command": "bl", "success": False, "error": str(e)})
+
             # Step 4: Continue execution if requested
+            # In kernel mode with a process switch already done above we already ran 'g',
+            # so skip it to avoid double-running unless explicitly requested again.
             execution_result = None
-            if continue_execution:
-                logger.debug("Continuing execution")
+            should_continue = continue_execution and not (is_kernel and process_address)
+            if should_continue:
                 try:
                     exec_result = execute_unified("g", resilient=True, optimize=True)
                     execution_result = {
@@ -445,60 +528,71 @@ def register_execution_tools(mcp: FastMCP):
                         "execution_mode": exec_result.execution_mode.value
                     }
                     results.append(execution_result)
-                    
                     if not exec_result.success:
                         logger.warning(f"Failed to continue execution: {exec_result.error}")
-                        
                 except Exception as e:
-                    execution_result = {
-                        "step": "continue_execution",
-                        "command": "g",
-                        "success": False,
-                        "error": str(e)
-                    }
+                    execution_result = {"step": "continue_execution", "command": "g", "success": False, "error": str(e)}
                     results.append(execution_result)
-            
-            # Prepare comprehensive response
+
+            # Prepare response
             total_time = sum(r.get("execution_time", 0) for r in results)
             successful_steps = sum(1 for r in results if r.get("success", False))
-            
+
+            bp_step_idx = 0
+            for i, r in enumerate(results):
+                if r.get("step") == "set_breakpoint":
+                    bp_step_idx = i
+                    break
+
             response = {
                 "success": True,
                 "breakpoint": breakpoint,
-                "breakpoint_set": results[1 if clear_existing else 0].get("success", False),
-                "execution_continued": execution_result.get("success", False) if execution_result else False,
+                "breakpoint_set": results[bp_step_idx].get("success", False),
+                "execution_continued": execution_result.get("success", False) if execution_result else (is_kernel and process_address),
                 "steps_completed": results,
                 "summary": {
                     "total_steps": len(results),
                     "successful_steps": successful_steps,
                     "total_execution_time": total_time,
-                    "context_saved": context_saved
+                    "context_saved": context_saved,
+                    "kernel_mode": is_kernel,
+                    "process_context_switched": bool(is_kernel and process_address)
                 }
             }
-            
-            # Add debugging guidance
+
             guidance = []
-            if execution_result and execution_result.get("success"):
-                guidance.extend([
-                    "✅ Breakpoint set and execution continued",
-                    "🎯 Target will break when the specified location is hit",
-                    "📊 Use 'k' to examine call stack when breakpoint hits",
-                    "🔍 Use 'r' to examine registers when breakpoint hits",
-                    "➡️ Use 'p' to step over or 'g' to continue after breakpoint"
-                ])
-            elif results[1 if clear_existing else 0].get("success", False):
-                guidance.extend([
-                    "✅ Breakpoint set successfully",
-                    "⏸️ Use 'g' to continue execution and hit the breakpoint",
-                    "🎯 Target will break when the specified location is hit"
-                ])
-            
-            if clear_existing and results[0].get("success", False):
-                guidance.append("🧹 Previous breakpoints cleared successfully")
-            
+            if is_kernel:
+                if process_address:
+                    guidance += [
+                        "✅ Breakpoint set inside the target process's VA space",
+                        "⚠️  The breakpoint fires only when that process's thread hits this location",
+                        "🔄 The debugger ran 'g' to reach the process context boundary — the breakpoint is now armed",
+                        "🎯 When the breakpoint hits, use analyze_thread(action='stack') to inspect the call stack",
+                        "📋 Use analyze_process(action='restore') to return to kernel context when done"
+                    ]
+                else:
+                    guidance += [
+                        "⚠️  Kernel-mode global breakpoint set — fires for ALL processes hitting this code",
+                        "💡 To restrict to a specific process (e.g. dwm.exe), re-run with process_address='<EPROCESS>'",
+                        "💡 Alternatively use use_hardware_bp=True for an address-based hardware breakpoint",
+                        "🎯 When the breakpoint hits, verify the current process with !process -1 0"
+                    ]
+            else:
+                if results[bp_step_idx].get("success") and (execution_result and execution_result.get("success")):
+                    guidance += [
+                        "✅ Breakpoint set and execution continued",
+                        "🎯 Target will break when the specified location is hit",
+                        "📊 Use 'k' to examine call stack when breakpoint hits",
+                        "➡️ Use 'p' to step over or 'g' to continue after breakpoint"
+                    ]
+                elif results[bp_step_idx].get("success"):
+                    guidance += [
+                        "✅ Breakpoint set successfully",
+                        "⏸️ Use 'g' to continue execution and hit the breakpoint"
+                    ]
+
             response["guidance"] = guidance
-            
-            # Add troubleshooting tips if something failed
+
             if successful_steps < len(results):
                 response["troubleshooting"] = [
                     "Some steps failed - check individual step results",
@@ -506,17 +600,17 @@ def register_execution_tools(mcp: FastMCP):
                     "Check that symbols are properly loaded",
                     "Ensure the breakpoint location is valid"
                 ]
-            
+
             return response
-            
+
         except Exception as e:
-            enhanced_error = enhance_error("unexpected", 
-                                         tool_name="breakpoint_and_continue", 
+            enhanced_error = enhance_error("unexpected",
+                                         tool_name="breakpoint_and_continue",
                                          original_error=str(e))
             error_dict = enhanced_error.to_dict()
             error_dict["partial_results"] = results
             error_dict["breakpoint"] = breakpoint
-            return error_dict 
+            return error_dict
 
     @mcp.tool()
     async def break_into_target(ctx: Context) -> Dict[str, Any]:
