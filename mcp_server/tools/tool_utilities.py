@@ -16,11 +16,14 @@ def detect_kernel_mode() -> bool:
         from core.execution.timeout_resolver import resolve_timeout
         from config import DebuggingMode
 
-        timeout_ms = resolve_timeout(".effmach", DebuggingMode.VM_NETWORK)
-        result = send_command(".effmach", timeout_ms=timeout_ms)
-        if result and any(x in result.lower() for x in ["x64_kernel", "x86_kernel", "kernel mode"]):
+        # .effmach outputs e.g. "x64" or "x86" in both modes; use vertarget which
+        # includes "Kernel" in the kernel-mode description.
+        timeout_ms = resolve_timeout("vertarget", DebuggingMode.VM_NETWORK)
+        result = send_command("vertarget", timeout_ms=timeout_ms)
+        if result and "kernel" in result.lower():
             return True
 
+        # Fallback: !pcr is a kernel-only command; success means kernel mode.
         timeout_ms = resolve_timeout("!pcr", DebuggingMode.VM_NETWORK)
         result = send_command("!pcr", timeout_ms=timeout_ms)
         if result and not result.startswith("Error:") and "is not a recognized" not in result:

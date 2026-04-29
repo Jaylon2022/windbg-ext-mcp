@@ -187,9 +187,13 @@ def register_session_tools(mcp: FastMCP):
                 try:
                     version_output = send_command("version", timeout_ms=_get_timeout("version"))
                     
-                    # Detect debugging mode
-                    is_kernel = "kernel" in version_output.lower()
-                    is_user = "user" in version_output.lower() or not is_kernel
+                    # Detect debugging mode via vertarget which contains "Kernel" in kernel sessions.
+                    try:
+                        vertarget_output = send_command("vertarget", timeout_ms=_get_timeout("vertarget"))
+                        is_kernel = "kernel" in vertarget_output.lower()
+                    except Exception:
+                        is_kernel = False
+                    is_user = not is_kernel
                     
                     # Try to get module information
                     try:

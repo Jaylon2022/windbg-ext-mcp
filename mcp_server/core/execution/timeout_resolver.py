@@ -164,7 +164,8 @@ class TimeoutResolver:
             return TimeoutCategory.STREAMING
         
         # Large analysis commands
-        elif any(cmd in command_lower for cmd in ["!analyze -v", "!thread -1", "!process -1"]):
+        elif any(cmd in command_lower for cmd in ["!analyze -v", "!thread -1", "!process -1",
+                                                  "!stacks"]):
             return TimeoutCategory.LARGE_ANALYSIS
         
         # Bulk operations
