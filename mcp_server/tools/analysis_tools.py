@@ -1093,4 +1093,396 @@ def register_analysis_tools(mcp: FastMCP):
                 
         except Exception as e:
             enhanced_error = enhance_error("unexpected", tool_name="analyze_kernel", original_error=str(e))
-            return enhanced_error.to_dict() 
+            return enhanced_error.to_dict()
+
+    @mcp.tool()
+    async def analyze_code(ctx: Context, action: str, module: str = "", symbol: str = "", address: str = "", length: int = 20, frame: int = -1) -> Union[str, Dict[str, Any]]:
+        """
+        Analyze driver code with PDB symbols and disassembly.
+
+        **Typical workflow — "why did execution reach this point?"**
+
+          Step 1 — Verify symbols:  analyze_code(action='symbols', module='mydriver')
+          Step 2 — Find function:   analyze_code(action='find', module='mydriver', symbol='*IrpHandler*')
+          Step 3 — Disassemble:     analyze_code(action='disasm', symbol='mydriver!MyIrpHandler')
+          Step 4 — See call sites:  analyze_code(action='calls', symbol='mydriver!MyIrpHandler')
+          Step 5 — Stack + frames:  analyze_thread(action='stack')
+                                    analyze_code(action='frame', frame=2)   ← locals of frame 2
+          Step 6 — Registers:       analyze_code(action='registers')
+          Step 7 — Nearest symbol:  analyze_code(action='nearest', address='<rip value>')
+
+        **PDB private symbol setup:**
+
+          When a private PDB is available locally on the debugger machine:
+            analyze_code(action='add_sympath', symbol='C:\\\\Symbols\\\\MyDriver')
+          Then force-reload:
+            analyze_code(action='reload', module='mydriver.sys')
+
+        Args:
+            ctx: The MCP context
+            action: Action to perform:
+                    "symbols"    - check symbol status for a module (lmv m <module>)
+                    "find"       - find symbols matching a pattern (x <module>!<symbol>)
+                                   use '*' wildcards, e.g. symbol='*Dispatch*'
+                    "nearest"    - find nearest symbol to an address (ln <address>)
+                                   essential for mapping raw RIP/EIP from a crash to code
+                    "disasm"     - disassemble a whole function following all branches
+                                   (uf <module>!<symbol>  or  uf <address>)
+                    "disasm_raw" - linear disassembly from an address (u <address> L<length>)
+                    "calls"      - show only call instructions inside a function (uf /c <symbol>)
+                                   reveals the call graph without full disassembly noise
+                    "frame"      - switch to a specific stack frame and display local variables
+                                   (.frame <n>  +  dv)  — use after analyze_thread(action='stack')
+                    "registers"  - show CPU registers at the current context (r)
+                    "source"     - show source lines around current instruction (lsa .  or  lsa <addr>)
+                    "add_sympath"- append a directory to the symbol search path (.sympath+ <path>)
+                                   use with symbol=<path>
+                    "reload"     - reload symbols for a specific module or all (.reload /f <module>)
+            module: Module/driver name (without .sys), e.g. 'mydriver' or 'nt'
+            symbol: Symbol pattern or full qualified symbol 'module!function', or path for add_sympath
+            address: Memory address (hex), used for nearest/disasm_raw/source
+            length: Number of instructions for disasm_raw (default: 20)
+            frame: Stack frame number for 'frame' action (default: -1 = current frame 0)
+
+        Returns:
+            Code analysis results with next-step guidance
+        """
+        logger.debug(f"Analyze code action: {action}, module: {module}, symbol: {symbol}, address: {address}")
+
+        try:
+            if action == "symbols":
+                # Check PDB symbol status for a module.
+                # The 'pdb symbols' line in lmv output confirms a private PDB was loaded.
+                # 'export symbols' means only the export table was used — no type info.
+                if not module:
+                    return {
+                        "error": "'symbols' action requires the 'module' parameter",
+                        "example": "analyze_code(action='symbols', module='mydriver')",
+                        "tip": "Use the module name without .sys extension"
+                    }
+                try:
+                    result = send_command(f"lmv m {module}", timeout_ms=_get_timeout(f"lmv m {module}"))
+                    sympath = send_command(".sympath", timeout_ms=_get_timeout(".sympath"))
+                    has_pdb = "pdb symbols" in result.lower()
+                    return {
+                        "output": result,
+                        "module": module,
+                        "pdb_loaded": has_pdb,
+                        "symbol_path": sympath.strip(),
+                        "next_steps": (
+                            [
+                                "PDB loaded — private symbols available",
+                                f"Find functions: analyze_code(action='find', module='{module}', symbol='*')",
+                                f"Disassemble: analyze_code(action='disasm', symbol='{module}!FunctionName')"
+                            ] if has_pdb else [
+                                "Only export symbols — no type/line info available",
+                                "If you have the PDB file, add its folder: "
+                                "analyze_code(action='add_sympath', symbol='C:\\\\path\\\\to\\\\pdb')",
+                                f"Then force reload: analyze_code(action='reload', module='{module}.sys')",
+                                "Or configure a symbol server: .symfix+ C:\\\\SymCache"
+                            ]
+                        )
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command=f"lmv m {module}", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "find":
+                # Find symbols matching a wildcard pattern inside a module.
+                # This is the first step to locate a function by name when you have PDB.
+                if not module and not symbol:
+                    return {
+                        "error": "'find' requires at least 'module' (and optionally 'symbol' as a wildcard pattern)",
+                        "example": "analyze_code(action='find', module='mydriver', symbol='*Dispatch*')",
+                        "tip": "Omit symbol to list ALL exported symbols of the module"
+                    }
+                pattern = f"{module}!{symbol}" if module else symbol
+                if module and not symbol:
+                    pattern = f"{module}!*"
+                try:
+                    result = send_command(f"x {pattern}", timeout_ms=_get_timeout(f"x {pattern}"))
+                    # Extract matched symbols for structured output
+                    matches = re.findall(r'([0-9a-fA-F`]+)\s+(\S+)', result)
+                    return {
+                        "output": result,
+                        "pattern": pattern,
+                        "match_count": len(matches),
+                        "matches": [{"address": m[0], "symbol": m[1]} for m in matches[:30]],
+                        "next_steps": [
+                            f"Disassemble a function: analyze_code(action='disasm', symbol='<module>!<function>')",
+                            f"Show call graph: analyze_code(action='calls', symbol='<module>!<function>')"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command=f"x {pattern}", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "nearest":
+                # Map a raw address (e.g. a crashed RIP/EIP, or an unknown call target) to
+                # the nearest named symbol.  This answers "what function is this address in?"
+                if not address:
+                    return {
+                        "error": "'nearest' requires the 'address' parameter",
+                        "example": "analyze_code(action='nearest', address='0xfffff80012345678')",
+                        "tip": "Use the RIP/EIP value from a crash or from a stack frame"
+                    }
+                try:
+                    result = send_command(f"ln {address}", timeout_ms=_get_timeout(f"ln {address}"))
+                    return {
+                        "output": result,
+                        "address": address,
+                        "next_steps": [
+                            "Copy the symbol name above to disassemble the function:",
+                            f"analyze_code(action='disasm', symbol='<symbol from output>')",
+                            "Or verify full module info: analyze_code(action='symbols', module='<module>')"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command=f"ln {address}", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "disasm":
+                # Full function disassembly following all branches.
+                # 'uf' tracks conditional jumps and shows the complete control flow graph
+                # in topological order — much better than raw linear 'u' for understanding logic.
+                # Requires either a symbol (module!function) or an address.
+                target = symbol if symbol else address
+                if not target:
+                    return {
+                        "error": "'disasm' requires 'symbol' (e.g. 'mydriver!MyFunc') or 'address'",
+                        "example": "analyze_code(action='disasm', symbol='mydriver!DriverEntry')",
+                        "tip": "Use analyze_code(action='find') first to locate the exact symbol name"
+                    }
+                try:
+                    result = send_command(f"uf {target}", timeout_ms=_get_timeout(f"uf {target}"))
+                    return {
+                        "output": result,
+                        "target": target,
+                        "note": (
+                            "'uf' shows the full control-flow graph of the function. "
+                            "Branches are shown in reachability order, not linear address order."
+                        ),
+                        "next_steps": [
+                            "To see only call sites: analyze_code(action='calls', symbol='" + target + "')",
+                            "To inspect a call target: analyze_code(action='nearest', address='<call target addr>')",
+                            "To see parameters at runtime: analyze_code(action='frame', frame=0) after breaking"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command=f"uf {target}", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "disasm_raw":
+                # Linear disassembly from a specific address.
+                # Use this when you want to see N instructions starting at an exact address,
+                # regardless of function boundaries (e.g. mid-function after a crash).
+                if not address:
+                    return {
+                        "error": "'disasm_raw' requires the 'address' parameter",
+                        "example": "analyze_code(action='disasm_raw', address='0xfffff800`12345678', length=30)"
+                    }
+                try:
+                    result = send_command(f"u {address} L{length}", timeout_ms=_get_timeout(f"u {address} L{length}"))
+                    return {
+                        "output": result,
+                        "address": address,
+                        "instructions": length
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command=f"u {address} L{length}", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "calls":
+                # Show only the CALL instructions inside a function.
+                # 'uf /c' is the fastest way to build a call-graph without reading
+                # through the full disassembly.  The output lists each call target
+                # with its address and symbol, so you immediately see what the function calls.
+                target = symbol if symbol else address
+                if not target:
+                    return {
+                        "error": "'calls' requires 'symbol' or 'address'",
+                        "example": "analyze_code(action='calls', symbol='mydriver!MyIrpHandler')"
+                    }
+                try:
+                    result = send_command(f"uf /c {target}", timeout_ms=_get_timeout(f"uf /c {target}"))
+                    return {
+                        "output": result,
+                        "target": target,
+                        "note": "Each line shows a call instruction and its resolved target symbol.",
+                        "next_steps": [
+                            "Disassemble a callee: analyze_code(action='disasm', symbol='<callee symbol>')",
+                            "Check if a callee is suspicious: analyze_code(action='nearest', address='<addr>')"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command=f"uf /c {target}", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "frame":
+                # Switch to a specific call stack frame and show local variables.
+                # After analyze_thread(action='stack') reveals the call chain, use this
+                # to drill into each frame to see argument values and local state.
+                frame_num = frame if frame >= 0 else 0
+                try:
+                    # Switch frame
+                    frame_result = send_command(f".frame {frame_num}", timeout_ms=_get_timeout(f".frame {frame_num}"))
+                    # Display locals and parameters
+                    dv_result = send_command("dv /t /v", timeout_ms=_get_timeout("dv /t /v"))
+                    # Also get registers at this frame
+                    reg_result = send_command("r rip, rsp, rbp", timeout_ms=_get_timeout("r rip, rsp, rbp"))
+                    return {
+                        "frame": frame_num,
+                        "frame_info": frame_result,
+                        "local_variables": dv_result,
+                        "frame_registers": reg_result,
+                        "note": (
+                            "dv /t /v shows local variables with their types and memory addresses. "
+                            "Use 'dt <type> <addr>' to expand a struct pointer."
+                        ),
+                        "next_steps": [
+                            f"Inspect previous frame: analyze_code(action='frame', frame={frame_num + 1})",
+                            "Disassemble the function in this frame: see 'frame_info' for the symbol name",
+                            "Expand a struct: analyze_memory(action='type', address='<addr>', type_name='<type>')"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command=f".frame {frame_num}", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "registers":
+                # Dump all CPU registers at the current context.
+                # After a crash or breakpoint this shows RIP (instruction pointer),
+                # RSP (stack pointer), and general-purpose registers with their values.
+                try:
+                    result = send_command("r", timeout_ms=_get_timeout("r"))
+                    rip_match = re.search(r'rip=([0-9a-fA-F`]+)', result, re.IGNORECASE)
+                    rip = rip_match.group(1) if rip_match else None
+                    return {
+                        "output": result,
+                        "rip": rip,
+                        "next_steps": (
+                            [
+                                f"Find what function RIP belongs to: analyze_code(action='nearest', address='{rip}')",
+                                f"Disassemble around RIP: analyze_code(action='disasm_raw', address='{rip}', length=20)"
+                            ] if rip else [
+                                "Use analyze_code(action='nearest', address='<rip value>') to map RIP to a symbol"
+                            ]
+                        )
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command="r", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "source":
+                # Show source lines around the current or a specific instruction.
+                # Requires that source files are accessible (.srcpath must be configured).
+                # 'lsa .' shows lines around the current instruction pointer.
+                try:
+                    if address:
+                        result = send_command(f"lsa {address}", timeout_ms=_get_timeout(f"lsa {address}"))
+                    else:
+                        result = send_command("lsa .", timeout_ms=_get_timeout("lsa ."))
+                    srcpath = send_command(".srcpath", timeout_ms=_get_timeout(".srcpath"))
+                    return {
+                        "output": result,
+                        "source_path": srcpath.strip(),
+                        "tip": (
+                            "If source is not found, add the source directory: "
+                            ".srcpath+ C:\\\\path\\\\to\\\\driver\\\\src"
+                        )
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command="lsa .", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "add_sympath":
+                # Append a local PDB directory to the symbol search path.
+                # After this, run analyze_code(action='reload', module='<driver>.sys')
+                # to pick up the private PDB.
+                path = symbol if symbol else address
+                if not path:
+                    return {
+                        "error": "'add_sympath' requires the PDB folder path in the 'symbol' parameter",
+                        "example": "analyze_code(action='add_sympath', symbol='C:\\\\Symbols\\\\MyDriver')"
+                    }
+                try:
+                    result = send_command(f".sympath+ {path}", timeout_ms=_get_timeout(f".sympath+ {path}"))
+                    new_path = send_command(".sympath", timeout_ms=_get_timeout(".sympath"))
+                    return {
+                        "output": result,
+                        "updated_sympath": new_path.strip(),
+                        "next_steps": [
+                            f"Force reload symbols for your driver: "
+                            f"analyze_code(action='reload', module='<driver>.sys')"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command=f".sympath+ {path}", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            elif action == "reload":
+                # Force-reload symbols for a specific module.
+                # Use after add_sympath or after copying a PDB to the symbol cache.
+                # .reload /f forces an immediate load even if symbols were previously
+                # loaded from a different source.
+                mod = module if module else symbol
+                if not mod:
+                    return {
+                        "error": "'reload' requires 'module' (the .sys filename, e.g. 'mydriver.sys')",
+                        "example": "analyze_code(action='reload', module='mydriver.sys')"
+                    }
+                try:
+                    cmd = f".reload /f {mod}"
+                    result = send_command(cmd, timeout_ms=_get_timeout(cmd))
+                    # Verify what was loaded
+                    base = mod.replace(".sys", "").replace(".dll", "").replace(".exe", "")
+                    verify = send_command(f"lmv m {base}", timeout_ms=_get_timeout(f"lmv m {base}"))
+                    has_pdb = "pdb symbols" in verify.lower()
+                    return {
+                        "reload_output": result,
+                        "symbol_status": verify,
+                        "pdb_loaded": has_pdb,
+                        "next_steps": [
+                            f"Find functions: analyze_code(action='find', module='{base}', symbol='*')"
+                        ] if has_pdb else [
+                            "PDB not found after reload — check that the .pdb file is in the sympath directory",
+                            f"Current sympath: run analyze_code(action='symbols', module='{base}') to verify"
+                        ]
+                    }
+                except Exception as e:
+                    enhanced_error = enhance_error("execution", command=f".reload /f {mod}", original_error=str(e))
+                    return enhanced_error.to_dict()
+
+            else:
+                return {
+                    "error": f"Unknown action: {action}",
+                    "available_actions": [
+                        "symbols", "find", "nearest", "disasm", "disasm_raw",
+                        "calls", "frame", "registers", "source", "add_sympath", "reload"
+                    ],
+                    "recommended_workflow": [
+                        "1. analyze_code(action='symbols', module='mydriver')         — verify PDB loaded",
+                        "2. analyze_code(action='add_sympath', symbol='C:\\\\PDB')   — add PDB folder if needed",
+                        "3. analyze_code(action='reload', module='mydriver.sys')      — force load PDB",
+                        "4. analyze_code(action='find', module='mydriver', symbol='*Dispatch*') — find functions",
+                        "5. analyze_code(action='disasm', symbol='mydriver!Function') — full disassembly",
+                        "6. analyze_code(action='calls', symbol='mydriver!Function')  — call graph",
+                        "7. analyze_thread(action='stack')                            — call stack at crash",
+                        "8. analyze_code(action='frame', frame=2)                     — locals of frame 2",
+                        "9. analyze_code(action='registers')                          — CPU registers",
+                        "10. analyze_code(action='nearest', address='<rip>')          — map address to symbol"
+                    ],
+                    "examples": [
+                        "analyze_code(action='symbols', module='mydriver')",
+                        "analyze_code(action='find', module='mydriver', symbol='*Irp*')",
+                        "analyze_code(action='disasm', symbol='mydriver!MyDispatchRoutine')",
+                        "analyze_code(action='calls', symbol='mydriver!DriverEntry')",
+                        "analyze_code(action='nearest', address='0xfffff80012345600')",
+                        "analyze_code(action='frame', frame=0)",
+                        "analyze_code(action='registers')"
+                    ]
+                }
+
+        except Exception as e:
+            enhanced_error = enhance_error("unexpected", tool_name="analyze_code", original_error=str(e))
+            return enhanced_error.to_dict()

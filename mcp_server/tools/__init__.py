@@ -72,7 +72,7 @@ TOOL_CATEGORIES = {
         "description": "Tools for executing WinDbg commands with validation and error handling"
     },
     "analysis": {
-        "tools": ["analyze_process", "analyze_thread", "analyze_memory", "analyze_kernel"],
+        "tools": ["analyze_process", "analyze_thread", "analyze_memory", "analyze_kernel", "analyze_code"],
         "description": "Tools for analyzing debugging targets and system state"
     },
 

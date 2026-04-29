@@ -152,7 +152,7 @@ class TimeoutResolver:
             return TimeoutCategory.EXTENDED
         
         # Symbol operations (general)
-        elif any(cmd in command_lower for cmd in [".reload", ".sympath", ".symfix"]):
+        elif any(cmd in command_lower for cmd in [".reload", ".sympath", ".symfix", ".srcpath"]):
             return TimeoutCategory.SYMBOLS
         
         # Process list commands
@@ -163,13 +163,14 @@ class TimeoutResolver:
         elif any(cmd in command_lower for cmd in ["!for_each_process", "!for_each_thread", "!for_each_module"]):
             return TimeoutCategory.STREAMING
         
-        # Large analysis commands
+        # Large analysis commands — uf can be expensive for large/inlined functions
         elif any(cmd in command_lower for cmd in ["!analyze -v", "!thread -1", "!process -1",
-                                                  "!stacks"]):
+                                                  "!stacks", "uf ", "uf/c"]):
             return TimeoutCategory.LARGE_ANALYSIS
         
         # Bulk operations
-        elif any(cmd in command_lower for cmd in ["!process 0 0", "!handle 0 f", "lm", "!dlls", "!vm", "!address"]):
+        elif any(cmd in command_lower for cmd in ["!process 0 0", "!handle 0 f", "lm", "!dlls", "!vm", "!address",
+                                                  "lmv ", "x "]):
             return TimeoutCategory.BULK
         
         # Analysis operations
@@ -187,8 +188,9 @@ class TimeoutResolver:
         ):
             return TimeoutCategory.EXECUTION
         
-        # Quick commands
-        elif any(cmd in command_lower for cmd in ["version", "r", "?", ".effmach", "help"]):
+        # Quick commands — ln, .frame, dv, lsa are all fast reads
+        elif any(cmd in command_lower for cmd in ["version", "r", "?", ".effmach", "help",
+                                                  "ln ", ".frame ", "dv", "lsa"]):
             return TimeoutCategory.QUICK
         
         else:
